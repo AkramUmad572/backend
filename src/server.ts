@@ -12,6 +12,10 @@ app.use((req, res, next) => {
 
       const realIP = req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress;
       console.log(`📡 ${req.method} ${req.path} from ${realIP} (${req.headers['user-agent']?.slice(0, 50)})`);
+
+      if (req.headers['user-agent']?.slice(0, 6) === "GitHub") {
+        console.log(req);
+      }
   }
   next();
 });
