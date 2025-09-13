@@ -9,7 +9,9 @@ app.use((req, res, next) => {
   if (!req.path.includes('favicon') && 
       !req.path.includes('health') && 
       !req.path.includes('robots.txt')) {
-    console.log(`📡 ${req.method} ${req.path} from ${req.ip}`);
+
+      const realIP = req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress;
+      console.log(`📡 ${req.method} ${req.path} from ${realIP} (${req.headers['user-agent']?.slice(0, 50)})`);
   }
   next();
 });
