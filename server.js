@@ -339,55 +339,42 @@ app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
 // ------------------------------------------------------------
 // Doc History endpoint - Get full history of a doc file
 // ------------------------------------------------------------
-app.get('/api/doc-history/:owner/:repo/:filePath*', async (req, res) => {
+// ------------------------------------------------------------
+// Doc History endpoint - Get full history of a doc file
+// ------------------------------------------------------------
+app.get('/api/doc-history/:owner/:repo/*', async (req, res) => {
   try {
     const { owner, repo } = req.params;
-    // filePath will include slashes; decode in case it was URL-encoded
-    const filePath = decodeURIComponent(req.params.filePath || '');
+    const filePath = decodeURIComponent(req.params[0] || ''); // <- catch-all
+    if (!filePath) return res.status(400).json({ error: 'filePath required' });
+
     const branch = req.query.branch || 'main';
     const repoBranchId = `${owner}/${repo}#${branch}`;
 
-    // 1. Query all transactions for this repo/branch
     const { Items = [] } = await docClient.send(new QueryCommand({
       TableName: DYNAMO_TABLE,
       KeyConditionExpression: 'RepoBranch = :rb AND begins_with(SK, :txn)',
-      ExpressionAttributeValues: {
-        ':rb': repoBranchId,
-        ':txn': 'TXN#'
-      }
+      ExpressionAttributeValues: { ':rb': repoBranchId, ':txn': 'TXN#' }
     }));
 
-    // 2. Filter for transactions affecting this file
     const fileHistory = Items
       .filter(txn => (txn.docFilePath === filePath || txn.filePath === filePath))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // newest first
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-    // 3. For each version, fetch the content from GitHub
     const versions = await Promise.all(fileHistory.map(async (txn) => {
       let content = null;
       try {
-        // Try to get content using commit SHA
-        if (txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha) {
-          const sha = txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha;
-          const { data } = await octo.repos.getContent({
-            owner,
-            repo,
-            path: filePath,
-            ref: sha
-          });
+        const sha = txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha;
+        if (sha) {
+          const { data } = await octo.repos.getContent({ owner, repo, path: filePath, ref: sha });
+          if (Array.isArray(data) || data.type !== 'file') throw new Error('Path is not a file');
+          content = Buffer.from(data.content, 'base64').toString('utf8');
+        } else if (txn.blobSha) {
+          const { data } = await octo.git.getBlob({ owner, repo, file_sha: txn.blobSha });
           content = Buffer.from(data.content, 'base64').toString('utf8');
         }
-        // Fallback to blob SHA if available
-        else if (txn.blobSha) {
-          const { data } = await octo.git.getBlob({
-            owner,
-            repo,
-            file_sha: txn.blobSha
-          });
-          content = Buffer.from(data.content, 'base64').toString('utf8');
-        }
-      } catch (error) {
-        console.warn(`Could not fetch content for ${txn.SK}: ${error.message}`);
+      } catch (e) {
+        console.warn(`Could not fetch content for ${txn.SK}: ${e.message}`);
       }
 
       return {
@@ -406,13 +393,11 @@ app.get('/api/doc-history/:owner/:repo/:filePath*', async (req, res) => {
       };
     }));
 
-    // 4. Return the full history
     res.json({
       filePath,
       repoBranch: repoBranchId,
-      versions: versions.filter(v => v.content !== null) // Only return versions we could fetch
+      versions: versions.filter(v => v.content !== null)
     });
-
   } catch (error) {
     console.error('Error fetching doc history:', error);
     res.status(500).json({ error: 'Failed to fetch document history' });
