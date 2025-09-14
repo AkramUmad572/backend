@@ -224,7 +224,7 @@ ${docOnlyBullets || '(none)'}
 Preserve all unrelated changes. Output ONLY the full, final file contents (no fences).
     `.trim();
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
     const result = await model.generateContent({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
