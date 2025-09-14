@@ -47,6 +47,18 @@ function isTxn(item) {
   return item && typeof item.SK === 'string' && item.SK.startsWith('TXN#');
 }
 
+async function commitReadlog(owner, repo, path, newContent, prevSha, message) { 
+    const { data } = await octo.repos.createOrUpdateFileContents({ 
+        owner, repo, path, 
+        message, content: Buffer.from(newContent, 'utf8').toString('base64'), 
+        branch: BRANCH, ...(prevSha ? { sha: prevSha } : {}) 
+    }); 
+    return { 
+        docsRevertCommitSha: data?.commit?.sha || null, 
+        docFileSha: data?.content?.sha || null 
+    }; 
+}
+
 // Git “revertish”: create a new commit whose tree equals the first parent of the merge commit
 async function revertMergeCommit(mergeCommitSha, label) {
   const { data: refData } = await octo.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}` });
