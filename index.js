@@ -1,4 +1,4 @@
-// index.js (ESM) — PR merge → CHANGELOG append + DynamoDB PAIR transaction (two hashes)
+// index.js (ESM) — PR merge → CHANGELOG append + DynamoDB PAIR transaction (two hashes) + docs/ generation
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -22,6 +22,14 @@ const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN || process.env.JIRA_API_KEY;
 
 const AWS_REGION     = process.env.AWS_REGION || 'us-east-1';
 const DYNAMO_TABLE   = process.env.DYNAMODB_TABLE_NAME;
+
+// New: docs generation settings (non-breaking additions)
+const DOCS_DIR             = process.env.DOCS_DIR || 'docs';
+const DOC_LOG_FILE         = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
+const DOCS_AUTO            = String(process.env.DOCS_AUTO || 'true').toLowerCase() !== 'false'; // default on
+const DOCS_MAX_FILES       = Number(process.env.DOCS_MAX_FILES || 6);  // upper bound for safety
+const DOCS_MODEL_CANDIDATES = (process.env.DOCS_MODEL_CANDIDATES || 'gemini-2.5-pro,gemini-1.5-pro,gemini-1.5-flash,gemini-1.5-flash-latest,gemini-1.0-pro')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 // -------------------- ARGS --------------------
 const [,, owner, repo, prNumberArg, jiraKeyArg] = process.argv;
@@ -51,6 +59,85 @@ function pickTopCommitBullets(commits, n = 5) {
 }
 function isoDateOnly(s) {
   try { return (new Date(s)).toISOString().slice(0,10); } catch { return 'unknown'; }
+}
+
+// Lightweight heuristic to detect "docs-worthy" changes from diff text
+function extractDocsSignalsFromDiff(diffText = '') {
+  const lines = (diffText || '').split('\n');
+  const added = lines.filter(l => l.startsWith('+') && !l.startsWith('+++'));
+  const signals = {
+    apis: [],           // e.g., new endpoints
+    env: [],            // environment variables
+    cli: [],            // CLI flags/commands
+    config: [],         // config keys
+    types: [],          // exported types/interfaces
+    functions: [],      // exported functions or signatures
+    breaking: false,    // indicative of breaking changes
+  };
+
+  const pushMatch = (arr, regex, line) => {
+    const m = line.match(regex);
+    if (m && m[1]) arr.push(m[1]);
+  };
+
+  for (const l of added) {
+    // crude signals (language-agnostic patterns)
+    pushMatch(signals.apis, /\b(router\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`])/i, l);
+    pushMatch(signals.apis, /\b(app\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`])/i, l);
+    pushMatch(signals.apis, /\bpath:\s*['"`]([^'"`]+)['"`]\s*,\s*method:\s*['"`](get|post|put|patch|delete)['"`]/i, l);
+    pushMatch(signals.env, /\bprocess\.env\.([A-Z0-9_]+)/, l);
+    pushMatch(signals.env, /ENV\[['"`]([A-Z0-9_]+)['"`]\]/i, l);
+    pushMatch(signals.cli, /\b--([a-z0-9-]+)\b/, l);
+    pushMatch(signals.config, /\b([A-Z0-9_]+)\s*[:=]\s*[^=]/, l);
+    pushMatch(signals.types, /\bexport\s+type\s+([A-Za-z0-9_]+)/, l);
+    pushMatch(signals.functions, /\bexport\s+(async\s+)?function\s+([A-Za-z0-9_]+)/, l);
+    if (/BREAKING|remove[d]? required|rename[d]? parameter|delete\s+endpoint/i.test(l)) {
+      signals.breaking = true;
+    }
+  }
+
+  // De-dup and shorten
+  const uniq = (arr) => Array.from(new Set(arr)).slice(0, 50);
+  signals.apis = uniq(signals.apis);
+  signals.env = uniq(signals.env);
+  signals.cli = uniq(signals.cli);
+  signals.config = uniq(signals.config);
+  signals.types = uniq(signals.types);
+  signals.functions = uniq(signals.functions);
+
+  // docs-worthy if we see any meaningful area or commit messages hint at doc work
+  const docsWorthy = signals.apis.length || signals.env.length || signals.cli.length ||
+                     signals.config.length || signals.types.length || signals.functions.length || signals.breaking;
+
+  return { signals, docsWorthy: !!docsWorthy };
+}
+
+// Summarize existing docs quickly to avoid duplication
+async function fetchDocsDirectorySummary(owner, repo, branch, dir = DOCS_DIR) {
+  try {
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(dir)}?ref=${encodeURIComponent(branch)}`;
+    const r = await fetchFn(url, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
+    if (!r.ok) return { files: [], snippets: [] };
+    const arr = await r.json();
+    if (!Array.isArray(arr)) return { files: [], snippets: [] };
+
+    const files = arr.filter(x => x.type === 'file' && /\.mdx?$/.test(x.name));
+    // Pull first ~600 chars of up to 6 files to guide the LLM
+    const snippets = [];
+    for (const f of files.slice(0, 6)) {
+      try {
+        const rf = await fetchFn(`${f.download_url}`, { headers: { 'User-Agent': 'DocFlow' } });
+        const txt = await rf.text();
+        snippets.push({
+          path: f.path,
+          head: txt.slice(0, 600)
+        });
+      } catch (_) { /* ignore */ }
+    }
+    return { files: files.map(f => f.path), snippets };
+  } catch {
+    return { files: [], snippets: [] };
+  }
 }
 
 // -------------------- CLIENTS --------------------
@@ -205,6 +292,7 @@ Return sections:
 `.trim();
 
   const MODEL_CANDIDATES = [
+    "gemini-2.5-pro",
     'gemini-1.5-flash',
     'gemini-1.5-flash-latest',
     'gemini-1.5-pro',
@@ -227,6 +315,144 @@ Return sections:
 
   console.warn('⚠️ All Gemini model attempts failed; using fallback summary.');
   return null;
+}
+
+// New: Robust docs generator prompt (returns a JSON "docs pack")
+async function generateDocsPackWithGemini({ pr, commits, jira, diffText, existingDocs, signals }) {
+  if (!GEMINI_API_KEY || !DOCS_AUTO) return null;
+
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+  const commitsList = (commits || [])
+    .map((c, i) => `${i + 1}. ${c.commit?.message || c.message || ''}`)
+    .join('\n');
+
+  const existingFilesList = (existingDocs?.files || []).map(p => `- ${p}`).join('\n') || '(none)';
+  const existingSnippets = (existingDocs?.snippets || [])
+    .map(s => `PATH: ${s.path}\nHEAD:\n${s.head}`)
+    .join('\n---\n');
+
+  const signalsBlock = JSON.stringify(signals || {}, null, 2);
+
+  const prompt = `
+You are a senior technical writer generating *concise, high-signal* documentation updates for a codebase.
+A PR has been merged. You must decide what to document and produce a set of Markdown files (in JSON) to upsert into the repository under the "docs/" directory.
+
+**CRITICAL RULES**
+- The changelog is already updated elsewhere; do NOT produce or mention a changelog here.
+- Only document *non-trivial* changes that affect usability or understanding:
+  - new or changed API endpoints, routes, message schemas, GraphQL ops
+  - new CLI commands or flags
+  - new environment variables or configuration keys
+  - new public functions/classes/exports, importantly their inputs/outputs
+  - breaking changes, migrations, deprecations, feature flags
+  - usage guides or examples required to successfully use new functionality
+- Ignore trivial/internal-only changes: formatting, refactors with no surface change, UI alignment, comment edits.
+- Avoid repetition with existing docs. If a section already exists, *update that section only*, do not duplicate content.
+- Keep everything concise, precise, and helpful (“how to use” over “what changed”).
+- Use Markdown only. No HTML. No frontmatter. Keep headings clear (##, ###).
+- Where appropriate, include code examples and request/response samples.
+- Maintain a single "docs/overview.md" that tracks **Active Features** as a bullet list with one-line explanations and links to deeper pages.
+  - Update “Active Features” entries if new user-visible features are introduced or changed.
+
+**INPUT CONTEXT**
+PR Title: ${pr.title}
+PR Description: ${pr.body || '(none)'}
+Commits:
+${commitsList || '(none)'}
+JIRA: ${jira ? `${jira.key} — ${jira.summary} (Status=${jira.status}, Priority=${jira.priority})` : '(none)'}
+JIRA Description:
+${jira?.description || '(none)'}
+Heuristic Signals (from diff):
+${signalsBlock}
+
+Unified Diff (truncated to first ~12k chars if longer):
+${(diffText || '').slice(0, 12000)}
+
+Existing docs files:
+${existingFilesList}
+
+Existing docs snippets (first ~600 chars each):
+${existingSnippets || '(none)'}
+
+**OUTPUT FORMAT**
+Return ONLY a JSON object with this exact shape (no prose around it):
+{
+  "files": [
+    { "path": "docs/<relative>.md", "mode": "upsert", "reason": "<why this file is touched>", "content": "<full markdown content>" },
+    ...
+  ],
+  "notes": "<one-line operator note (optional)>"
+}
+
+**CONTENT GUIDELINES**
+- If NOTHING deserves documentation, return { "files": [] }.
+- Paths to prefer:
+  - docs/overview.md (ensure "Active Features" section stays current)
+  - docs/api/<area>.md (REST/GraphQL/API endpoints and schemas)
+  - docs/cli/<tool>.md (commands/flags)
+  - docs/configuration.md (env vars & config keys)
+  - docs/how-to/<topic>.md (task-focused guides)
+- In updated files, include only the *full revised content* (we will replace file content).
+- Use explicit sections: "Overview", "When to use", "Parameters", "Responses", "Examples", "Breaking Changes", "Migration", "Feature Flags".
+- Keep it crisp and to the point.
+`.trim();
+
+  for (const modelName of DOCS_MODEL_CANDIDATES) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 3000 }
+      });
+      const raw = result?.response?.text?.();
+      if (!raw) continue;
+
+      // Try to parse JSON body; handle accidental fencing
+      const jsonStr = raw.trim().replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+      const parsed = JSON.parse(jsonStr);
+      if (parsed && Array.isArray(parsed.files)) {
+        // Safety clamp number of files
+        parsed.files = parsed.files.slice(0, DOCS_MAX_FILES);
+        return parsed;
+      }
+    } catch (err) {
+      console.warn(`⚠️ Docs model failed (${modelName}): ${err?.message || err}`);
+    }
+  }
+
+  return null;
+}
+
+// Apply docs pack by upserting each file into docs/
+async function applyDocsPack({ owner, repo, branch, pack }) {
+  if (!pack || !Array.isArray(pack.files) || pack.files.length === 0) return { applied: 0, results: [] };
+
+  const results = [];
+  let applied = 0;
+
+  for (const f of pack.files) {
+    if (!f || f.mode !== 'upsert' || !f.path || typeof f.content !== 'string') continue;
+    // ensure path under DOCS_DIR
+    const normalized = f.path.startsWith(`${DOCS_DIR}/`) ? f.path : `${DOCS_DIR}/${f.path}`.replaceAll('//', '/');
+
+    try {
+      const res = await upsertFile({
+        owner, repo,
+        path: normalized,
+        content: f.content,
+        message: `docs(update): PR #${prNumber} — ${f.reason || 'documentation update'}`,
+        branch
+      });
+      applied++;
+      results.push({ path: normalized, ok: true, sha: res?.content?.sha || null });
+    } catch (e) {
+      console.warn(`⚠️ Failed to upsert ${normalized}: ${e.message}`);
+      results.push({ path: normalized, ok: false, error: e.message });
+    }
+  }
+
+  return { applied, results };
 }
 
 // -------------------- RENDERER (HOUSE STYLE) --------------------
@@ -309,7 +535,7 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     const section = renderChangelogEntry({ pr, commits, jira, llm });
 
     // === Append to CHANGELOG.md (append-only) ===
-    const PATH = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
+    const PATH = DOC_LOG_FILE;
     const branch = pr.base?.ref || 'main';
     let existing = '';
     const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(PATH)}?ref=${encodeURIComponent(branch)}`;
@@ -334,6 +560,31 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     });
 
     console.log(`✅ Updated ${PATH} at ${writeResult?.content?.html_url || '(unknown URL)'} (sha ${writeResult?.content?.sha || 'n/a'})`);
+
+    // === Generate docs/ updates (non-trivial items only; append-only docs upserts) ===
+    try {
+      const { signals, docsWorthy } = extractDocsSignalsFromDiff(prDiff || '');
+      if (!DOCS_AUTO) {
+        console.log('ℹ️ DOCS_AUTO disabled; skipping docs generation.');
+      } else if (!docsWorthy) {
+        console.log('ℹ️ No docs-worthy signals detected in diff; skipping docs generation.');
+      } else {
+        // Read existing docs to avoid duplication
+        const existingDocs = await fetchDocsDirectorySummary(owner, repo, branch, DOCS_DIR);
+        const pack = await generateDocsPackWithGemini({
+          pr, commits, jira, diffText: prDiff || '', existingDocs, signals
+        });
+
+        if (pack && Array.isArray(pack.files) && pack.files.length) {
+          const applied = await applyDocsPack({ owner, repo, branch, pack });
+          console.log(`🧾 Docs pack applied: ${applied.applied} file(s).`);
+        } else {
+          console.log('ℹ️ LLM returned no docs files to update.');
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️ Docs generation failed: ${e.message}`);
+    }
 
     // === Record DynamoDB Transaction as PAIR ===
     if (!DYNAMO_TABLE) {
