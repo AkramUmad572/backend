@@ -13,6 +13,7 @@ import {
   TransactWriteCommand
 } from '@aws-sdk/lib-dynamodb';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import fetch from 'node-fetch';
 
 // ===== ENV / CONSTS =====
 const AWS_REGION     = process.env.AWS_REGION || 'us-east-1';
@@ -22,6 +23,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_TOKE
 
 const BRANCH      = 'main';
 const TARGET_FILE = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 
 // ===== ARGS =====
 const [OWNER, REPO, TARGET_TXN_ID] = process.argv.slice(2);
@@ -57,6 +59,36 @@ async function commitReadlog(owner, repo, path, newContent, prevSha, message) {
         docsRevertCommitSha: data?.commit?.sha || null, 
         docFileSha: data?.content?.sha || null 
     }; 
+}
+
+// Simple Slack notifier (Incoming Webhook)
+async function notifySlack({ header, text, fields = [] }) {
+  try {
+    if (!SLACK_WEBHOOK_URL) {
+      console.log('ℹ️ SLACK_WEBHOOK_URL not set; skipping Slack notification.');
+      return;
+    }
+    const payload = {
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: header.slice(0, 150) } },
+        { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 2900) } },
+        ...(fields.length
+          ? [{ type: 'section', fields: fields.map(f => ({ type: 'mrkdwn', text: f.slice(0, 2000) })) }]
+          : [])
+      ]
+    };
+    const r = await fetch(SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      console.warn(`⚠️ Slack webhook failed: ${r.status} ${r.statusText} ${t}`);
+    }
+  } catch (e) {
+    console.warn(`⚠️ Slack notify error: ${e.message}`);
+  }
 }
 
 // Git “revertish”: create a new commit whose tree equals the first parent of the merge commit
@@ -228,9 +260,27 @@ async function loadTargetAndRelated(owner, repo, targetTxnId) {
       prNumbers: prNumbersToRemove
     });
 
+    // 4) Slack Notification (non-blocking)
+    const changelogUrl = `https://github.com/${OWNER}/${REPO}/blob/${BRANCH}/${TARGET_FILE}`;
+    await notifySlack({
+      header: `🔁 Revert recorded on ${OWNER}/${REPO}`,
+      text: `*Reverted:* PR #${prNumber || 'unknown'}\n*Txn:* \`${TARGET_TXN_ID}\`\n*Changelog:* ${changelogUrl}`,
+      fields: [
+        `*Merge commit:*\n\`${target.mergeCommitSha || 'n/a'}\``,
+        `*Revert commit:*\n\`${codeRevertCommitSha || 'n/a'}\``,
+        `*Docs commit:*\n\`${docsRevertCommitSha || 'n/a'}\``
+      ]
+    });
+
     console.log('\n✨ Revert completed (code + docs).');
   } catch (err) {
     console.error(`\n❌ Revert failed: ${err.message}`);
+    try {
+      await notifySlack({
+        header: `❌ Revert failed on ${OWNER}/${REPO}`,
+        text: `*Txn:* \`${TARGET_TXN_ID}\`\n*Error:* ${err.message}`
+      });
+    } catch (_) {}
     process.exit(1);
   }
 })();

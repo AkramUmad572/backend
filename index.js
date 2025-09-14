@@ -1,4 +1,4 @@
-// index.js (ESM) — PR merge → CHANGELOG append + DynamoDB PAIR transaction (two hashes) + docs/ generation
+// index.js (ESM) — PR merge → CHANGELOG append + DynamoDB PAIR transaction (two hashes) + docs/ generation + Slack notify
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -28,8 +28,10 @@ const DOCS_DIR             = process.env.DOCS_DIR || 'docs';
 const DOC_LOG_FILE         = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
 const DOCS_AUTO            = String(process.env.DOCS_AUTO || 'true').toLowerCase() !== 'false'; // default on
 const DOCS_MAX_FILES       = Number(process.env.DOCS_MAX_FILES || 6);  // upper bound for safety
-const DOCS_MODEL_CANDIDATES = (process.env.DOCS_MODEL_CANDIDATES || 'gemini-2.5-pro,gemini-1.5-pro,gemini-1.5-flash,gemini-1.5-flash-latest,gemini-1.0-pro')
+const DOCS_MODEL_CANDIDATES = (process.env.DOCS_MODEL_CANDIDATES || 'gemini-1.5-pro,gemini-1.5-flash,gemini-1.5-flash-latest,gemini-1.0-pro')
   .split(',').map(s => s.trim()).filter(Boolean);
+
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 
 // -------------------- ARGS --------------------
 const [,, owner, repo, prNumberArg, jiraKeyArg] = process.argv;
@@ -59,6 +61,36 @@ function pickTopCommitBullets(commits, n = 5) {
 }
 function isoDateOnly(s) {
   try { return (new Date(s)).toISOString().slice(0,10); } catch { return 'unknown'; }
+}
+
+// Simple Slack notifier (Incoming Webhook)
+async function notifySlack({ header, text, fields = [] }) {
+  try {
+    if (!SLACK_WEBHOOK_URL) {
+      console.log('ℹ️ SLACK_WEBHOOK_URL not set; skipping Slack notification.');
+      return;
+    }
+    const payload = {
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: header.slice(0, 150) } },
+        { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 2900) } },
+        ...(fields.length
+          ? [{ type: 'section', fields: fields.map(f => ({ type: 'mrkdwn', text: f.slice(0, 2000) })) }]
+          : [])
+      ]
+    };
+    const r = await fetchFn(SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      console.warn(`⚠️ Slack webhook failed: ${r.status} ${r.statusText} ${t}`);
+    }
+  } catch (e) {
+    console.warn(`⚠️ Slack notify error: ${e.message}`);
+  }
 }
 
 // Lightweight heuristic to detect "docs-worthy" changes from diff text
@@ -347,7 +379,6 @@ Return sections:
 `.trim();
 
   const MODEL_CANDIDATES = [
-    "gemini-2.5-pro",
     'gemini-1.5-flash',
     'gemini-1.5-flash-latest',
     'gemini-1.5-pro',
@@ -621,6 +652,9 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     console.log(`✅ Updated ${PATH} at ${writeResult?.content?.html_url || '(unknown URL)'} (sha ${writeResult?.content?.sha || 'n/a'})`);
 
     // === Generate docs/ updates (non-trivial items only; append-only docs upserts) ===
+    let docsAppliedCount = 0;
+    let docsPackNote = '';
+    let docsUpdateSummaryFields = [];
     try {
       const { signals, docsWorthy } = extractDocsSignalsFromDiff(prDiff || '');
       const meta = extractDocsSignalsFromMeta(pr, commits);
@@ -639,6 +673,9 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
 
         if (pack && Array.isArray(pack.files) && pack.files.length) {
           const applied = await applyDocsPack({ owner, repo, branch, pack });
+          docsAppliedCount = applied.applied;
+          docsPackNote = (pack.notes || '').slice(0, 300);
+          docsUpdateSummaryFields = (pack.files || []).slice(0, 6).map(f => `*${f.path}*\n${(f.reason || 'update').slice(0, 80)}`);
           console.log(`🧾 Docs pack applied: ${applied.applied} file(s).`);
         } else {
           console.log('ℹ️ LLM returned no docs files to update.');
@@ -716,8 +753,34 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
 
     console.log(`🧾 Recorded PR transaction ${newTxnSK} (parent=${parentTxnSK})`);
 
+    // === Slack Notification (non-blocking)
+    const changelogUrl = writeResult?.content?.html_url || `https://github.com/${owner}/${repo}/blob/${branch}/${PATH}`;
+    const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+    const diffUrl = `https://github.com/${owner}/${repo}/compare/${(pr?.base?.sha || 'base')}...${(pr?.head?.sha || 'head')}`;
+    const fields = [
+      `*Repo:*\n${owner}/${repo}`,
+      `*PR:*\n#${prNumber}`,
+      `*Changelog:*\n${changelogUrl}`,
+      `*Docs updated:*\n${docsAppliedCount} file(s)`
+    ];
+    if (docsPackNote) fields.push(`*Note:*\n${docsPackNote}`);
+    if (docsUpdateSummaryFields.length) {
+      fields.push(...docsUpdateSummaryFields);
+    }
+    await notifySlack({
+      header: `✅ PR #${prNumber} merged — docs & changelog updated`,
+      text: `*${pr.title}*\n${prUrl}\n\nDiff: ${diffUrl}`,
+      fields
+    });
+
   } catch (err) {
     console.error('❌ Failed:', err);
+    try {
+      await notifySlack({
+        header: `❌ DocFlow error on ${owner}/${repo}`,
+        text: `PR #${prNumber}\n${err.message}`
+      });
+    } catch (_) {}
     process.exit(1);
   }
 })();
