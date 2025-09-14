@@ -47,6 +47,28 @@ function isTxn(item) {
   return item && typeof item.SK === 'string' && item.SK.startsWith('TXN#');
 }
 
+// Git “revertish”: create a new commit whose tree equals the first parent of the merge commit
+async function revertMergeCommit(mergeCommitSha, label) {
+  const { data: refData } = await octo.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}` });
+  const tipSha = refData.object.sha;
+
+  const { data: target } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: mergeCommitSha });
+  if (!target.parents?.length) throw new Error('Target commit has no parents; cannot revert.');
+  const parentSha = target.parents[0].sha;
+
+  const { data: parent } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: parentSha });
+  const treeSha = parent.tree.sha;
+
+  const { data: newCommit } = await octo.git.createCommit({
+    owner: OWNER, repo: REPO,
+    message: `Revert: "${label || 'merge'}"\n\nThis reverts commit ${mergeCommitSha}.`,
+    tree: treeSha,
+    parents: [tipSha]
+  });
+  await octo.git.updateRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: newCommit.sha });
+  return newCommit.sha;
+}
+
 function renderRevertEntry({ owner, repo, target, prNumber, codeRevertCommitSha }) {
   const date = new Date().toISOString().slice(0, 10);
   const title = target.prTitle || `PR #${prNumber}`;
