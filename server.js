@@ -1,148 +1,162 @@
-// server.js (Corrected and More Robust)
+// server.js (ESM) — FULL FILE with robust exec logging
 import dotenv from 'dotenv';
 dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import { exec } from 'child_process';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 
-// --- INITIALIZATION ---
 const app = express();
-app.use(cors());
 
-// --- FIX 1: ADD MIDDLEWARE FOR BOTH JSON AND URLENCODED PAYLOADS ---
+// Middleware
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-// ---------------------------------------------------------------------
 
-const SKIP_FLAG = '[skip-docflow]';
-const DOCS_DIR = 'docs';
-const DYNAMO_TABLE = process.env.DYNAMODB_TABLE_NAME;
-const dbClient = new DynamoDBClient({ region: process.env.AWS_REGION });
-const docClient = DynamoDBDocumentClient.from(dbClient);
+// Small helper to stream child output so nothing goes “silent”
+function run(cmd, label) {
+  console.log(`▶️  ${label}: ${cmd}`);
+  const child = exec(cmd, { maxBuffer: 1024 * 1024 * 20, cwd: process.cwd(), env: process.env });
+  child.stdout.on('data', d => process.stdout.write(`[${label} STDOUT] ${d}`));
+  child.stderr.on('data', d => process.stderr.write(`[${label} STDERR] ${d}`));
+  child.on('close', code => console.log(`✅ ${label} exited with code ${code}`));
+  child.on('error', err => console.error(`❌ ${label} failed to spawn:`, err));
+  return child;
+}
 
-// --- GITHUB WEBHOOK ENDPOINT (AUTOMATION) ---
+// Main webhook endpoint (GitHub → on PR merged)
+// ... keep existing imports, middleware, and run() helper ...
+
 app.post('/api/ingest', (req, res) => {
   const event = req.headers['x-github-event'];
-  console.log(`📨 Received GitHub webhook: ${event}`);
-
-  // --- FIX 2: NORMALIZE THE PAYLOAD AND ADD A SAFETY CHECK ---
-  let payload = req.body;
-  // If the payload came in as a form, the JSON will be in a 'payload' property.
-  if (req.headers['content-type'] === 'application/x-www-form-urlencoded' && payload.payload) {
-      try {
-          payload = JSON.parse(payload.payload);
-      } catch (e) {
-          console.error('❌ Failed to parse urlencoded payload:', e);
-          return res.status(400).json({ error: 'Invalid payload format' });
-      }
-  }
-
-  // This safety check prevents all similar crashes.
-  if (!payload || Object.keys(payload).length === 0) {
-      console.warn('⚠️ Webhook received with empty or unparsed body. Ignoring.');
-      return res.status(400).json({ error: 'Request body is missing or could not be parsed.' });
-  }
-  // -----------------------------------------------------------
+  const delivery = req.headers['x-github-delivery'];
+  console.log(`📨 Received GitHub webhook: ${event} (${delivery})`);
 
   if (event === 'ping') {
-    console.log('🏓 Ping event successful. Payload zen:', payload.zen);
-    return res.status(200).json({ message: 'Ping received' });
+    console.log('🏓 Received ping event from GitHub');
+    return res.status(200).json({ message: 'Ping received successfully' });
   }
 
-  // --- FIX 3: USE THE NORMALIZED `payload` OBJECT INSTEAD OF `req.body` ---
-  if (event === 'push' && payload.ref === 'refs/heads/main') {
-    const { head_commit, repository } = payload;
-    // ------------------------------------------------------------------------
-
-    if (!head_commit) {
-      return res.status(200).json({ message: 'Push event ignored (no head_commit).' });
+  // ✅ Handle docs-only pushes (auto "manual" transaction)
+  if (event === 'push') {
+    const payload = req.body;
+    const { head_commit, repository } = payload || {};
+    if (!payload || !repository) {
+      console.warn('⚠️ Malformed push payload.');
+      return res.status(400).json({ error: 'Malformed payload' });
     }
 
-    if (head_commit.message.includes(SKIP_FLAG)) {
-      console.log(`🚫 Bot commit detected. Ignoring to prevent loop.`);
+    // ignore bot/self commits that include [skip-docflow]
+    if (head_commit?.message?.includes('[skip-docflow]')) {
+      console.log('🚫 Bot commit detected. Ignoring to prevent loop.');
       return res.status(200).json({ message: 'Bot commit ignored.' });
     }
 
     const owner = repository.owner.login;
     const repo = repository.name;
+    const added = head_commit?.added || [];
+    const modified = head_commit?.modified || [];
+    const changedFiles = [...added, ...modified];
 
-    const prMatch = head_commit.message.match(/Merge pull request #(\d+)/);
-    if (prMatch) {
-      const prNumber = prMatch[1];
-      const sourceCommitSha = head_commit.id;
-      console.log(`✅ Human PR #${prNumber} merged. Triggering AI documentation bot...`);
-      const command = `node index.js ${owner} ${repo} ${prNumber} ${sourceCommitSha}`;
-      exec(command, (error, stdout, stderr) => { /* ... error handling ... */ });
-      return res.status(202).json({ message: 'Accepted: AI documentation process started.' });
+    // docs-only check
+    const isDocsOnly = changedFiles.length > 0 && changedFiles.every(p => p.startsWith('docs/'));
+    if (!isDocsOnly) {
+      console.log('ℹ️ Push was not docs-only. No action taken.');
+      return res.status(200).json({ message: 'Push ignored (not docs-only).' });
     }
 
-    const changedFiles = [].concat(head_commit.added || [], head_commit.modified || []);
-    const isDocsOnlyChange = changedFiles.length > 0 && changedFiles.every(file => file.startsWith(DOCS_DIR + '/'));
+    const author = head_commit?.author?.username || head_commit?.author?.name || 'unknown';
+    const message = head_commit?.message || '';
+    const commitSha = head_commit?.id;
 
-    if (isDocsOnlyChange) {
-      console.log(`📝 Manual "docs-only" commit detected. Recording transaction...`);
-      const author = head_commit.author.username;
-      const message = head_commit.message;
-      const commitSha = head_commit.id;
-      const command = `node process-manual-commit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${commitSha}`;
-      exec(command, (error, stdout, stderr) => { /* ... error handling ... */ });
-      return res.status(202).json({ message: 'Accepted: Manual documentation commit detected.' });
-    }
+    console.log(`📝 Docs-only push detected on ${owner}/${repo} @ ${commitSha?.slice(0,7)} — recording manual txn...`);
 
-    console.log(`ℹ️ Push was not a PR merge or a docs-only commit. Ignoring.`);
-    return res.status(200).json({ message: 'Push ignored.' });
+    // process-manual-commit.js: <owner> <repo> <authorJson> <messageJson> <commitSha>
+    const cmd = `node process-manual-commit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${commitSha}`;
+    run(cmd, 'process-manual-commit');
+
+    return res.status(202).json({ message: 'Accepted: docs-only push processed.', commit: commitSha });
   }
 
-  return res.status(200).json({ message: 'Event not processed.' });
-});
-
-// --- API ENDPOINT FOR MANUAL EDITS (FROM YOUR DASHBOARD'S EDITOR) ---
-app.post('/api/manual-edit', (req, res) => {
-    const { owner, repo, author, message, filePath, newContent } = req.body;
-    if (!owner || !repo || !author || !message || !filePath || !newContent) {
-        return res.status(400).json({ error: 'owner, repo, author, message, filePath, and newContent are required' });
+  // Existing pull_request flow (generate READLOG on merge)
+  if (event === 'pull_request') {
+    const { action, pull_request, repository } = req.body;
+    if (!pull_request || !repository) {
+      console.warn('⚠️ Malformed pull_request payload.');
+      return res.status(400).json({ error: 'Malformed payload' });
     }
 
-    // Use JSON.stringify to safely pass arguments with spaces and special characters
-    const command = `node manual-edit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${JSON.stringify(filePath)} ${JSON.stringify(newContent)}`;
-    console.log(`▶️  Manual edit request: ${command}`);
+    console.log(`PR Event: ${action} - PR #${pull_request.number}`);
 
-    exec(command, (error, stdout, stderr) => {
-        if (error) {
-            console.error(`❌ manual-edit.js error: ${error.message}\n${stderr}`);
-            return res.status(500).json({ error: 'Failed to process manual edit.', details: stderr });
-        }
-        console.log(`✅ Manual edit successful:\n${stdout}`);
-        res.status(200).json({ success: true, message: 'Manual edit processed successfully.', output: stdout });
-    });
+    if (action === 'closed' && pull_request.merged) {
+      console.log(`🎉 PR #${pull_request.number} was merged! Triggering changelog update...`);
+      const owner = repository.owner.login;
+      const repo = repository.name;
+      const prNumber = pull_request.number;
+      run(`node index.js ${owner} ${repo} ${prNumber}`, `index.js PR#${prNumber}`);
+      return res.status(202).json({
+        message: 'Accepted: PR merge event received and changelog generation process started.',
+        prNumber
+      });
+    }
+
+    console.log(`ℹ️  PR #${pull_request.number} was ${action} but not a merge. No action taken.`);
+    return res.status(200).json({ message: 'Event received but not a merge.' });
+  }
+
+  console.log(`ℹ️  Received unhandled event: ${event}`);
+  return res.status(200).json({ message: `Event ${event} received but not handled.` });
 });
 
-// --- API ENDPOINT FOR REVERTS (FROM YOUR DASHBOARD) ---
 app.post('/api/revert', (req, res) => {
-    const { owner, repo, transactionId } = req.body;
-    if (!owner || !repo || !transactionId) {
-        return res.status(400).json({ error: 'owner, repo, and transactionId are required' });
-    }
+  const { owner, repo, transactionId } = req.body || {};
+  if (!owner || !repo || !transactionId) {
+    return res.status(400).json({ error: 'owner, repo, transactionId are required' });
+  }
 
-    const command = `node revert.js ${owner} ${repo} "${transactionId}"`;
-    console.log(`▶️  Revert request: ${command}`);
+  const cmd = `node revert.js ${owner} ${repo} "${transactionId}"`;
+  console.log(`▶️  Revert request: ${cmd}`);
 
-    exec(command, (error, stdout, stderr) => {
-        if (error) {
-            console.error(`❌ revert.js error: ${error.message}\n${stderr}`);
-            return res.status(500).json({ error: 'Failed to process revert.', details: stderr });
-        }
-        console.log(`✅ Revert successful:\n${stdout}`);
-        res.status(200).json({ success: true, message: 'Revert processed successfully.', output: stdout });
-    });
+  const child = run(cmd, `revert ${transactionId}`);
+  res.status(202).json({
+    message: 'Accepted: revert process started.',
+    owner,
+    repo,
+    transactionId
+  });
 });
 
-// --- HEALTH AND ROOT ENDPOINTS ---
-app.get('/api/health', (req, res) => res.json({ status: 'healthy', timestamp: new Date().toISOString() }));
-app.get('/', (req, res) => res.json({ message: 'DocFlow API Webhook Server is running' }));
+// Manual trigger endpoint (for PR + JIRA ticket)
+app.post('/api/manual-ingest', (req, res) => {
+  const { owner, repo, prNumber, jiraKey } = req.body || {};
+  if (!owner || !repo || !prNumber) {
+    return res.status(400).json({ error: 'owner, repo, prNumber are required' });
+  }
 
-// --- SERVER START ---
+  const cmd = `node index.js ${owner} ${repo} ${prNumber}${jiraKey ? ` ${jiraKey}` : ''}`;
+  console.log(`▶️  Manual ingest: ${cmd}`);
+
+  const child = run(cmd, `manual index.js PR#${prNumber}`);
+  // Respond immediately; logs stream to server output
+  res.status(200).json({ ok: true, prNumber, jiraKey: jiraKey || null });
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'DocFlow API Webhook Server is running',
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 DocFlow API Webhook Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 DocFlow API Webhook Server running on port ${PORT}`);
+});
