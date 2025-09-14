@@ -110,7 +110,7 @@ app.post('/api/ingest', (req, res) => {
       const prNumber = pull_request.number;
 
       console.log(`🎉 PR #${prNumber} was merged! Triggering changelog update...`);
-      run(`node index.js ${owner} ${repo} ${prNumber}`, `READLOG-${prNumber}`);
+      run(`node index.js ${owner} ${repo} ${prNumber}`, `CHANGELOG-${prNumber}`);
 
       // README processor — opt-in only:
       //   1) Env flag READMEBOT_AUTO=true, OR

@@ -65,35 +65,58 @@ function isoDateOnly(s) {
 function extractDocsSignalsFromDiff(diffText = '') {
   const lines = (diffText || '').split('\n');
   const added = lines.filter(l => l.startsWith('+') && !l.startsWith('+++'));
+  const removed = lines.filter(l => l.startsWith('-') && !l.startsWith('---'));
   const signals = {
     apis: [],           // e.g., new endpoints
     env: [],            // environment variables
     cli: [],            // CLI flags/commands
     config: [],         // config keys
-    types: [],          // exported types/interfaces
-    functions: [],      // exported functions or signatures
+    types: [],          // exported types/interfaces/classes
+    functions: [],      // exported/def functions or signatures
+    pythonFunctions: [],// python def signatures
+    pythonClasses: [],  // python class additions
     breaking: false,    // indicative of breaking changes
+    fileHints: []       // file/module hints that look core
   };
 
-  const pushMatch = (arr, regex, line) => {
+  const pushMatch = (arr, regex, line, pickIndex = 1) => {
     const m = line.match(regex);
-    if (m && m[1]) arr.push(m[1]);
+    if (m && m[pickIndex]) arr.push(m[pickIndex]);
   };
 
   for (const l of added) {
-    // crude signals (language-agnostic patterns)
-    pushMatch(signals.apis, /\b(router\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`])/i, l);
-    pushMatch(signals.apis, /\b(app\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`])/i, l);
-    pushMatch(signals.apis, /\bpath:\s*['"`]([^'"`]+)['"`]\s*,\s*method:\s*['"`](get|post|put|patch|delete)['"`]/i, l);
-    pushMatch(signals.env, /\bprocess\.env\.([A-Z0-9_]+)/, l);
-    pushMatch(signals.env, /ENV\[['"`]([A-Z0-9_]+)['"`]\]/i, l);
-    pushMatch(signals.cli, /\b--([a-z0-9-]+)\b/, l);
-    pushMatch(signals.config, /\b([A-Z0-9_]+)\s*[:=]\s*[^=]/, l);
-    pushMatch(signals.types, /\bexport\s+type\s+([A-Za-z0-9_]+)/, l);
-    pushMatch(signals.functions, /\bexport\s+(async\s+)?function\s+([A-Za-z0-9_]+)/, l);
+    // generic web/API style endpoints
+    pushMatch(signals.apis, /\b(router|app)\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`]/i, l, 3);
+    pushMatch(signals.apis, /\bpath:\s*['"`]([^'"`]+)['"`]\s*,\s*method:\s*['"`](get|post|put|patch|delete)['"`]/i, l, 1);
+
+    // env/config/cli
+    pushMatch(signals.env, /\bprocess\.env\.([A-Z0-9_]+)/, l, 1);
+    pushMatch(signals.env, /ENV\[['"`]([A-Z0-9_]+)['"`]\]/i, l, 1);
+    pushMatch(signals.cli, /\s--([a-z0-9][a-z0-9-]*)\b/, l, 1);
+    pushMatch(signals.config, /\b([A-Z0-9_]+)\s*[:=]\s*[^=]/, l, 1);
+
+    // TypeScript/JS exports
+    pushMatch(signals.types, /\bexport\s+type\s+([A-Za-z0-9_]+)/, l, 1);
+    pushMatch(signals.types, /\bexport\s+interface\s+([A-Za-z0-9_]+)/, l, 1);
+    pushMatch(signals.functions, /\bexport\s+(async\s+)?function\s+([A-Za-z0-9_]+)/, l, 2);
+
+    // Python: new defs/classes (treat as user-facing if in core modules)
+    pushMatch(signals.pythonFunctions, /^\+def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*:/, l, 0); // keep raw signature
+    pushMatch(signals.pythonClasses, /^\+class\s+([A-Za-z_]\w*)\s*[:\(]/, l, 1);
+
     if (/BREAKING|remove[d]? required|rename[d]? parameter|delete\s+endpoint/i.test(l)) {
       signals.breaking = true;
     }
+    if (/(core|engine|kernel|path[_-]?finder|routing|planner|match(er)?|auth|payment)/i.test(l)) {
+      signals.fileHints.push('core-logic');
+    }
+  }
+
+  // crude indicator of signature changes: removal + addition of def lines
+  const removedDefs = removed.filter(l => /^-def\s+[A-Za-z_]\w*\s*\(/.test(l)).length;
+  const addedDefs = added.filter(l => /^\+def\s+[A-Za-z_]\w*\s*\(/.test(l)).length;
+  if (addedDefs && removedDefs) {
+    signals.breaking = signals.breaking || (addedDefs !== removedDefs); // possible signature drift
   }
 
   // De-dup and shorten
@@ -104,12 +127,44 @@ function extractDocsSignalsFromDiff(diffText = '') {
   signals.config = uniq(signals.config);
   signals.types = uniq(signals.types);
   signals.functions = uniq(signals.functions);
+  signals.pythonFunctions = uniq(signals.pythonFunctions);
+  signals.pythonClasses = uniq(signals.pythonClasses);
+  signals.fileHints = uniq(signals.fileHints);
 
-  // docs-worthy if we see any meaningful area or commit messages hint at doc work
+  // docs-worthy if we see any meaningful area or hints
   const docsWorthy = signals.apis.length || signals.env.length || signals.cli.length ||
-                     signals.config.length || signals.types.length || signals.functions.length || signals.breaking;
+                     signals.config.length || signals.types.length || signals.functions.length ||
+                     signals.pythonFunctions.length || signals.pythonClasses.length ||
+                     signals.fileHints.length || signals.breaking;
 
   return { signals, docsWorthy: !!docsWorthy };
+}
+
+// NEW: meta-based trigger from PR title/body and commit messages
+function extractDocsSignalsFromMeta(pr, commits = []) {
+  const text = [
+    pr?.title || '',
+    pr?.body || '',
+    ...(commits || []).map(c => c?.commit?.message || c?.message || '')
+  ].join('\n').toLowerCase();
+
+  const keywords = [
+    'api', 'endpoint', 'endpoints', 'route', 'graphql', 'schema',
+    'config', 'configuration', 'env', 'environment variable',
+    'cli', 'flag', 'command',
+    'parameter', 'arg', 'argument', 'signature',
+    'breaking', 'deprecate', 'deprecated', 'migrate', 'migration', 'rename',
+    'feature flag', 'enable', 'toggle',
+    'algorithm', 'pathfinding', 'path-finding', 'path finder', 'core', 'module', 'library'
+  ];
+
+  const matched = keywords.filter(k => text.includes(k));
+  const docsWorthyMeta = matched.length > 0;
+
+  return {
+    matchedKeywords: matched,
+    docsWorthyMeta
+  };
 }
 
 // Summarize existing docs quickly to avoid duplication
@@ -292,7 +347,7 @@ Return sections:
 `.trim();
 
   const MODEL_CANDIDATES = [
-    "gemini-2.5-pro",
+    "gemini-1.5-pro",
     'gemini-1.5-flash',
     'gemini-1.5-flash-latest',
     'gemini-1.5-pro',
@@ -318,7 +373,7 @@ Return sections:
 }
 
 // New: Robust docs generator prompt (returns a JSON "docs pack")
-async function generateDocsPackWithGemini({ pr, commits, jira, diffText, existingDocs, signals }) {
+async function generateDocsPackWithGemini({ pr, commits, jira, diffText, existingDocs, signals, meta }) {
   if (!GEMINI_API_KEY || !DOCS_AUTO) return null;
 
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -333,6 +388,7 @@ async function generateDocsPackWithGemini({ pr, commits, jira, diffText, existin
     .join('\n---\n');
 
   const signalsBlock = JSON.stringify(signals || {}, null, 2);
+  const metaBlock = JSON.stringify(meta || {}, null, 2);
 
   const prompt = `
 You are a senior technical writer generating *concise, high-signal* documentation updates for a codebase.
@@ -345,9 +401,10 @@ A PR has been merged. You must decide what to document and produce a set of Mark
   - new CLI commands or flags
   - new environment variables or configuration keys
   - new public functions/classes/exports, importantly their inputs/outputs
+  - core algorithm changes that materially affect behavior (e.g., pathfinding)
   - breaking changes, migrations, deprecations, feature flags
   - usage guides or examples required to successfully use new functionality
-- Ignore trivial/internal-only changes: formatting, refactors with no surface change, UI alignment, comment edits.
+- Ignore trivial/internal-only changes: formatting, refactors with no surface change, UI alignment (e.g., centering a div), comment edits.
 - Avoid repetition with existing docs. If a section already exists, *update that section only*, do not duplicate content.
 - Keep everything concise, precise, and helpful (“how to use” over “what changed”).
 - Use Markdown only. No HTML. No frontmatter. Keep headings clear (##, ###).
@@ -365,6 +422,8 @@ JIRA Description:
 ${jira?.description || '(none)'}
 Heuristic Signals (from diff):
 ${signalsBlock}
+Meta Signals (keywords from title/body/commits):
+${metaBlock}
 
 Unified Diff (truncated to first ~12k chars if longer):
 ${(diffText || '').slice(0, 12000)}
@@ -379,8 +438,7 @@ ${existingSnippets || '(none)'}
 Return ONLY a JSON object with this exact shape (no prose around it):
 {
   "files": [
-    { "path": "docs/<relative>.md", "mode": "upsert", "reason": "<why this file is touched>", "content": "<full markdown content>" },
-    ...
+    { "path": "docs/<relative>.md", "mode": "upsert", "reason": "<why this file is touched>", "content": "<full markdown content>" }
   ],
   "notes": "<one-line operator note (optional)>"
 }
@@ -393,6 +451,7 @@ Return ONLY a JSON object with this exact shape (no prose around it):
   - docs/cli/<tool>.md (commands/flags)
   - docs/configuration.md (env vars & config keys)
   - docs/how-to/<topic>.md (task-focused guides)
+  - docs/modules/<module>.md (core modules like path_finder)
 - In updated files, include only the *full revised content* (we will replace file content).
 - Use explicit sections: "Overview", "When to use", "Parameters", "Responses", "Examples", "Breaking Changes", "Migration", "Feature Flags".
 - Keep it crisp and to the point.
@@ -564,15 +623,18 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     // === Generate docs/ updates (non-trivial items only; append-only docs upserts) ===
     try {
       const { signals, docsWorthy } = extractDocsSignalsFromDiff(prDiff || '');
+      const meta = extractDocsSignalsFromMeta(pr, commits);
+      const docsTrigger = docsWorthy || meta.docsWorthyMeta;
+
       if (!DOCS_AUTO) {
         console.log('ℹ️ DOCS_AUTO disabled; skipping docs generation.');
-      } else if (!docsWorthy) {
-        console.log('ℹ️ No docs-worthy signals detected in diff; skipping docs generation.');
+      } else if (!docsTrigger) {
+        console.log('ℹ️ No docs-worthy signals detected in diff/meta; skipping docs generation.');
       } else {
         // Read existing docs to avoid duplication
         const existingDocs = await fetchDocsDirectorySummary(owner, repo, branch, DOCS_DIR);
         const pack = await generateDocsPackWithGemini({
-          pr, commits, jira, diffText: prDiff || '', existingDocs, signals
+          pr, commits, jira, diffText: prDiff || '', existingDocs, signals, meta
         });
 
         if (pack && Array.isArray(pack.files) && pack.files.length) {
