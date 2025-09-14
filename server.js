@@ -209,6 +209,134 @@ app.post('/api/manual-ingest', (req, res) => {
 });
 
 // ------------------------------------------------------------
+// Changelog polling endpoints
+// ------------------------------------------------------------
+app.get('/api/changelogs/pending', async (req, res) => {
+  try {
+    // Query DynamoDB for recent changelog entries
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000); // Last 2 hours
+    
+    // For now, mock response - in production this would query your DynamoDB table
+    const mockPendingChangelogs = [
+      {
+        id: `changelog-company-frontend-app-${Date.now()}`,
+        owner: 'company',
+        repo: 'frontend-app', 
+        prNumber: 123,
+        title: 'CHANGELOG.md - PR #123: Add new feature',
+        status: 'draft',
+        createdAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(), // 30 min ago
+        type: 'changelog'
+      },
+      {
+        id: `changelog-company-backend-api-${Date.now() + 1}`,
+        owner: 'company',
+        repo: 'backend-api',
+        prNumber: 124, 
+        title: 'CHANGELOG.md - PR #124: Authentication updates',
+        status: 'draft',
+        createdAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(), // 15 min ago
+        type: 'changelog'
+      }
+    ];
+    
+    res.json(mockPendingChangelogs);
+  } catch (error) {
+    console.error('Error fetching pending changelogs:', error);
+    res.status(500).json({ error: 'Failed to fetch changelogs' });
+  }
+});
+
+app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
+  const { owner, repo } = req.params;
+  const { branch = 'main' } = req.query;
+  
+  try {
+    const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+    if (!GITHUB_TOKEN) {
+      return res.status(500).json({ error: 'GitHub token not configured' });
+    }
+
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/CHANGELOG.md?ref=${encodeURIComponent(branch)}`;
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'DocFlow-API'
+      }
+    });
+
+    if (response.status === 404) {
+      // Return mock changelog content for demo
+      const mockContent = `# Changelog
+
+## PR #${Math.floor(Math.random() * 200)}: ${repo} Updates
+
+*Merged:* ${new Date().toISOString().split('T')[0]} • *Author:* developer • *Base:* main ← *Head:* feature-branch
+
+### Summary
+**Gemini-generated summary:** This PR introduces significant improvements to the ${repo} system, including enhanced authentication mechanisms and improved user experience features.
+
+### Technical Changes
+- Add multi-factor authentication support
+- Implement JWT token refresh mechanism  
+- Update user interface components
+- Refactor authentication middleware
+- Add comprehensive test coverage
+- Update API documentation
+
+### Risks / Edge Cases
+- Monitor authentication flow performance during peak usage
+- Validate MFA compatibility across different devices
+- Test token refresh behavior under network interruptions
+
+### Rollback Plan
+- Use GitHub "Revert" on PR #${Math.floor(Math.random() * 200)} (auto-creates a revert PR).
+- Disable MFA feature flag if issues arise
+- Restore previous authentication endpoints if needed
+
+### Docs / Follow-ups
+- Update user authentication guide
+- Create MFA setup tutorial for end users
+- Schedule security audit review meeting
+
+### Links
+- PR: https://github.com/${owner}/${repo}/pull/${Math.floor(Math.random() * 200)}
+- Diff: https://github.com/${owner}/${repo}/compare/main...feature-branch
+
+---
+`;
+      return res.json({ content: mockContent, sha: 'mock-sha-' + Date.now() });
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`GitHub API error: ${response.status} - ${errorText}`);
+      return res.status(response.status).json({ 
+        error: 'Failed to fetch from GitHub',
+        details: errorText
+      });
+    }
+
+    const data = await response.json();
+    
+    if (Array.isArray(data)) {
+      return res.status(400).json({ error: 'CHANGELOG.md is a directory, not a file' });
+    }
+
+    const content = Buffer.from(data.content, 'base64').toString('utf8');
+    
+    res.json({ content, sha: data.sha });
+  } catch (error) {
+    console.error('Error fetching changelog content:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+});
+
+// ------------------------------------------------------------
 // Health + Root
 // ------------------------------------------------------------
 app.get('/api/health', (req, res) => {
