@@ -1,4 +1,7 @@
 // server.js (ESM)
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import { exec } from 'child_process';
 
@@ -7,7 +10,7 @@ const app = express();
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 
-// Main webhook endpoint
+// Main webhook endpoint (GitHub → on PR merged)
 app.post('/api/ingest', (req, res) => {
   const event = req.headers['x-github-event'];
   const delivery = req.headers['x-github-delivery'];
@@ -38,17 +41,14 @@ app.post('/api/ingest', (req, res) => {
         if (error) {
           console.error(`❌ Error executing index.js: ${error.message}`);
           console.error(`stderr: ${stderr}`);
-          // Don't immediately send a 500, as the webhook has been received.
-          // The error is in the background processing.
           return;
         }
         if (stderr) {
-            console.warn(`stderr from index.js: ${stderr}`);
+          console.warn(`stderr from index.js: ${stderr}`);
         }
         console.log(`stdout from index.js:\n${stdout}`);
       });
 
-      // Respond immediately to GitHub to avoid timeouts
       return res.status(202).json({
         message: 'Accepted: PR merge event received and changelog generation process started.',
         prNumber: prNumber,
@@ -61,6 +61,28 @@ app.post('/api/ingest', (req, res) => {
 
   console.log(`ℹ️  Received unhandled event: ${event}`);
   return res.status(200).json({ message: `Event ${event} received but not handled.` });
+});
+
+// Manual trigger endpoint (for PR + JIRA ticket)
+app.post('/api/manual-ingest', (req, res) => {
+  const { owner, repo, prNumber, jiraKey } = req.body || {};
+  if (!owner || !repo || !prNumber) {
+    return res.status(400).json({ error: 'owner, repo, prNumber are required' });
+  }
+
+  const cmd = `node index.js ${owner} ${repo} ${prNumber}${jiraKey ? ` ${jiraKey}` : ''}`;
+  console.log(`▶️  Manual ingest: ${cmd}`);
+
+  exec(cmd, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`❌ index.js error: ${error.message}`);
+      console.error(stderr);
+      return res.status(500).json({ error: error.message, stderr });
+    }
+    if (stderr) console.warn(stderr);
+    console.log(stdout);
+    return res.status(200).json({ ok: true, prNumber, jiraKey: jiraKey || null, output: stdout });
+  });
 });
 
 // Health check endpoint
@@ -79,7 +101,6 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log(`🚀 DocFlow API Webhook Server running on port ${PORT}`);
 });
