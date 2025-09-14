@@ -337,6 +337,126 @@ app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
 });
 
 // ------------------------------------------------------------
+// Doc History endpoint - Get full history of a doc file
+// ------------------------------------------------------------
+app.get('/api/doc-history/:owner/:repo/:filePath(*)', async (req, res) => {
+  try {
+    const { owner, repo, filePath } = req.params;
+    const branch = req.query.branch || 'main';
+    const repoBranchId = `${owner}/${repo}#${branch}`;
+
+    // 1. Query all transactions for this repo/branch
+    const { Items = [] } = await docClient.send(new QueryCommand({
+      TableName: DYNAMO_TABLE,
+      KeyConditionExpression: 'RepoBranch = :rb AND begins_with(SK, :txn)',
+      ExpressionAttributeValues: {
+        ':rb': repoBranchId,
+        ':txn': 'TXN#'
+      }
+    }));
+
+    // 2. Filter for transactions affecting this file
+    const fileHistory = Items
+      .filter(txn => (txn.docFilePath === filePath || txn.filePath === filePath))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // newest first
+
+    // 3. For each version, fetch the content from GitHub
+    const versions = await Promise.all(fileHistory.map(async (txn) => {
+      let content = null;
+      try {
+        // Try to get content using commit SHA
+        if (txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha) {
+          const sha = txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha;
+          const { data } = await octo.repos.getContent({
+            owner,
+            repo,
+            path: filePath,
+            ref: sha
+          });
+          content = Buffer.from(data.content, 'base64').toString('utf8');
+        }
+        // Fallback to blob SHA if available
+        else if (txn.blobSha) {
+          const { data } = await octo.git.getBlob({
+            owner,
+            repo,
+            file_sha: txn.blobSha
+          });
+          content = Buffer.from(data.content, 'base64').toString('utf8');
+        }
+      } catch (error) {
+        console.warn(`Could not fetch content for ${txn.SK}: ${error.message}`);
+      }
+
+      return {
+        id: txn.SK,
+        timestamp: txn.createdAt,
+        type: txn.type,
+        author: txn.author || txn.prAuthor,
+        message: txn.message,
+        prNumber: txn.prNumber,
+        commitSha: txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha,
+        blobSha: txn.blobSha,
+        content,
+        parentTxnSK: txn.parentTxnSK,
+        conceptKey: txn.conceptKey,
+        contentHash: txn.docChangeHash
+      };
+    }));
+
+    // 4. Return the full history
+    res.json({
+      filePath,
+      repoBranch: repoBranchId,
+      versions: versions.filter(v => v.content !== null) // Only return versions we could fetch
+    });
+
+  } catch (error) {
+    console.error('Error fetching doc history:', error);
+    res.status(500).json({ error: 'Failed to fetch document history' });
+  }
+});
+
+// ------------------------------------------------------------
+// Doc Diff endpoint - Compare two versions
+// ------------------------------------------------------------
+app.get('/api/doc-diff/:owner/:repo', async (req, res) => {
+  try {
+    const { owner, repo } = req.params;
+    const { fromSha, toSha, filePath } = req.query;
+
+    if (!fromSha || !toSha || !filePath) {
+      return res.status(400).json({ error: 'fromSha, toSha, and filePath are required' });
+    }
+
+    // Fetch both versions
+    const [fromContent, toContent] = await Promise.all([
+      octo.repos.getContent({ owner, repo, path: filePath, ref: fromSha })
+        .then(r => Buffer.from(r.data.content, 'base64').toString('utf8')),
+      octo.repos.getContent({ owner, repo, path: filePath, ref: toSha })
+        .then(r => Buffer.from(r.data.content, 'base64').toString('utf8'))
+    ]);
+
+    // Create a simple diff
+    const diff = {
+      additions: toContent.split('\n').filter(line => !fromContent.includes(line)),
+      deletions: fromContent.split('\n').filter(line => !toContent.includes(line))
+    };
+
+    res.json({
+      fromSha,
+      toSha,
+      filePath,
+      diff
+    });
+
+  } catch (error) {
+    console.error('Error generating diff:', error);
+    res.status(500).json({ error: 'Failed to generate diff' });
+  }
+});
+
+// ------------------------------------------------------------
 // Health + Root
 // ------------------------------------------------------------
 app.get('/api/health', (req, res) => {
