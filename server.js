@@ -337,48 +337,107 @@ app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// Doc History endpoint - Get full history of a doc file
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-// Doc History endpoint - Get full history of a doc file
+// Doc History endpoint (robust): uses Dynamo if available,
+// otherwise falls back to GitHub commit history for the file
 // ------------------------------------------------------------
 app.get('/api/doc-history', async (req, res) => {
   try {
-    const owner   = req.query.owner;
-    const repo    = req.query.repo;
-    const filePath = req.query.filePath ? decodeURIComponent(req.query.filePath) : '';
-    const branch   = req.query.branch || 'main';
+    const owner = req.query.owner;
+    const repo = req.query.repo;
+    const branch = (req.query.branch || 'main').trim();
+    let filePath = req.query.filePath ? decodeURIComponent(req.query.filePath) : '';
 
     if (!owner || !repo || !filePath) {
       return res.status(400).json({ error: 'owner, repo, and filePath are required' });
     }
 
+    // Normalize "docs%2F..." vs "/docs/..."
+    filePath = filePath.replace(/^\/+/, '');
+
     const repoBranchId = `${owner}/${repo}#${branch}`;
 
-    const { Items = [] } = await docClient.send(new QueryCommand({
-      TableName: DYNAMO_TABLE,
-      KeyConditionExpression: 'RepoBranch = :rb AND begins_with(SK, :txn)',
-      ExpressionAttributeValues: { ':rb': repoBranchId, ':txn': 'TXN#' }
-    }));
+    // ---------- Try Dynamo first ----------
+    let items = [];
+    try {
+      const dynamoResp = await docClient.send(new QueryCommand({
+        TableName: DYNAMO_TABLE,
+        KeyConditionExpression: 'RepoBranch = :rb AND begins_with(SK, :txn)',
+        ExpressionAttributeValues: { ':rb': repoBranchId, ':txn': 'TXN#' }
+      }));
+      items = dynamoResp?.Items ?? [];
+    } catch (e) {
+      // Non-fatal — we’ll fall back to GitHub history
+      console.warn('[doc-history] Dynamo query failed, falling back to GitHub:', e.message);
+    }
 
-    const fileHistory = Items
-      .filter(txn => (txn.docFilePath === filePath || txn.filePath === filePath))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // newest first
+    // Filter Dynamo items to only this file (if any)
+    let fileHistory = Array.isArray(items)
+      ? items.filter(t => t?.docFilePath === filePath || t?.filePath === filePath)
+      : [];
 
+    // If Dynamo had nothing usable, FALL BACK to GitHub commit history for this path
+    if (fileHistory.length === 0) {
+      const commitsResp = await octo.repos.listCommits({
+        owner,
+        repo,
+        sha: branch,
+        path: filePath,
+        per_page: 25, // tune as needed
+      });
+
+      // Shape to look similar to your Dynamo items so the rest of the code can reuse logic
+      fileHistory = (commitsResp.data || []).map(c => ({
+        SK: `TXN#${c.sha}`,
+        createdAt: c.commit?.author?.date || c.commit?.committer?.date || '',
+        type: 'GITHUB_COMMIT',
+        author: c.commit?.author?.name || c.author?.login,
+        message: c.commit?.message,
+        prNumber: null,
+        commitSha: c.sha,
+        manualCommitSha: null,
+        docsRevertCommitSha: null,
+        blobSha: null,
+        docFilePath: filePath,
+        filePath: filePath,
+        parentTxnSK: null,
+        conceptKey: null,
+        docChangeHash: null,
+      }));
+    }
+
+    // Newest first
+    fileHistory.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+
+    // Fetch file content for each version (skip if file wasn’t present in that commit)
     const versions = await Promise.all(fileHistory.map(async (txn) => {
       let content = null;
+      let usedSha = txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha;
+
       try {
-        const sha = txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha;
-        if (sha) {
-          const { data } = await octo.repos.getContent({ owner, repo, path: filePath, ref: sha });
-          if (Array.isArray(data) || data.type !== 'file') throw new Error('Path is not a file');
-          content = Buffer.from(data.content, 'base64').toString('utf8');
+        if (usedSha) {
+          // Contents API at a specific commit
+          const { data } = await octo.repos.getContent({
+            owner,
+            repo,
+            path: filePath,
+            ref: usedSha,
+          });
+
+          if (!Array.isArray(data) && data?.type === 'file' && data?.content) {
+            content = Buffer.from(data.content, 'base64').toString('utf8');
+          } else {
+            // path might not exist in this commit, or is a directory
+            content = null;
+          }
         } else if (txn.blobSha) {
+          // Rare path: blob fallback
           const { data } = await octo.git.getBlob({ owner, repo, file_sha: txn.blobSha });
           content = Buffer.from(data.content, 'base64').toString('utf8');
+          usedSha = txn.blobSha;
         }
       } catch (e) {
-        console.warn(`Could not fetch content for ${txn.SK}: ${e.message}`);
+        // Common: 404 when file didn’t exist yet in that commit
+        console.warn(`[doc-history] Could not fetch content @ ${usedSha || txn.SK}: ${e.message}`);
       }
 
       return {
@@ -388,23 +447,27 @@ app.get('/api/doc-history', async (req, res) => {
         author: txn.author || txn.prAuthor,
         message: txn.message,
         prNumber: txn.prNumber,
-        commitSha: txn.commitSha || txn.manualCommitSha || txn.docsRevertCommitSha,
-        blobSha: txn.blobSha,
+        commitSha: usedSha || null,
+        blobSha: txn.blobSha || null,
         content,
-        parentTxnSK: txn.parentTxnSK,
-        conceptKey: txn.conceptKey,
-        contentHash: txn.docChangeHash
+        parentTxnSK: txn.parentTxnSK || null,
+        conceptKey: txn.conceptKey || null,
+        contentHash: txn.docChangeHash || null,
       };
     }));
 
-    res.json({
+    // Return only versions where we actually fetched content
+    const ok = versions.filter(v => v.content !== null);
+
+    // If nothing had content, still respond with empty history (not a 500)
+    return res.json({
       filePath,
       repoBranch: repoBranchId,
-      versions: versions.filter(v => v.content !== null)
+      versions: ok,
     });
   } catch (error) {
-    console.error('Error fetching doc history:', error);
-    res.status(500).json({ error: 'Failed to fetch document history' });
+    console.error('[doc-history] Fatal error:', error);
+    return res.status(500).json({ error: 'Failed to fetch document history' });
   }
 });
 
