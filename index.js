@@ -1,4 +1,4 @@
-// index.js (ESM) — PR merge → READLOG update + DynamoDB PAIR transaction (two hashes)
+// index.js (ESM) — PR merge → CHANGELOG append + DynamoDB PAIR transaction (two hashes)
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -51,24 +51,6 @@ function pickTopCommitBullets(commits, n = 5) {
 }
 function isoDateOnly(s) {
   try { return (new Date(s)).toISOString().slice(0,10); } catch { return 'unknown'; }
-}
-
-// Remove any existing block for this PR to make the write idempotent
-function stripExistingPrSection(markdown, prNumber) {
-  if (!markdown) return '';
-  const lines = markdown.split('\n');
-  const keep = [];
-  for (let i = 0; i < lines.length; ) {
-    const m = lines[i].match(/^##\s+PR\s+#(\d+)\b/);
-    if (m && String(prNumber) === m[1]) {
-      let j = i + 1;
-      while (j < lines.length && !/^##\s+PR\s+#\d+/.test(lines[j])) j++;
-      i = j; // drop existing PR block
-    } else {
-      keep.push(lines[i]); i++;
-    }
-  }
-  return keep.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
 }
 
 // -------------------- CLIENTS --------------------
@@ -326,32 +308,28 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
 
     const section = renderChangelogEntry({ pr, commits, jira, llm });
 
-    // === Upsert READLOG.md (prepend) ===
-    const PATH = 'READLOG.md';
+    // === Append to CHANGELOG.md (append-only) ===
+    const PATH = 'CHANGELOG.md';
     const branch = pr.base?.ref || 'main';
     let existing = '';
     const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(PATH)}?ref=${encodeURIComponent(branch)}`;
     const getRes = await fetchFn(getUrl, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
     if (getRes.ok) {
       const blob = await getRes.json();
-      if (blob?.content) {
-        existing = Buffer.from(blob.content, 'base64').toString('utf8');
-      } else {
-        existing = '# Release / Change Log\n\n';
-      }
-    } else {
-      existing = '# Release / Change Log\n\n';
+      existing = Buffer.isBuffer(blob?.content)
+        ? Buffer.from(blob.content, 'base64').toString('utf8')
+        : (blob?.content ? Buffer.from(blob.content, 'base64').toString('utf8') : '');
     }
+    if (!existing) existing = '# Changelog\n\n';
 
-    // Remove any existing PR block before adding a fresh one
-    existing = stripExistingPrSection(existing, pr.number);
-
+    // Append new section at the TOP to keep latest-first, without deleting older entries
     const newContent = [section, existing].join('\n');
+
     const writeResult = await upsertFile({
       owner, repo,
       path: PATH,
       content: newContent,
-      message: `docs(readlog): add PR #${prNumber}${jira ? ` + ${jira.key}` : ''}`,
+      message: `docs(changelog): add PR #${prNumber}${jira ? ` + ${jira.key}` : ''}`,
       branch
     });
 
@@ -400,8 +378,8 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
       // Hashes for reversibility
       parentChangeHash,              // sha256 of PR diff text
       parentChangeType: 'GITHUB_PR_DIFF_SHA256',
-      docChangeHash,                 // sha256 of the READLOG section we prepended
-      docChangeType: 'READLOG_SECTION_SHA256',
+      docChangeHash,                 // sha256 of the CHANGELOG section we prepended
+      docChangeType: 'CHANGELOG_SECTION_SHA256',
 
       // Concept linking
       conceptKey,
