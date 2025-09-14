@@ -11,6 +11,8 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.888.0",
+    "@aws-sdk/lib-dynamodb": "^3.888.0",
     "@google/generative-ai": "^0.24.1",
     "@octokit/rest": "^22.0.0",
     "cors": "^2.8.5",
