@@ -21,7 +21,7 @@ const GITHUB_TOKEN   = process.env.GITHUB_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_TOKEN;
 
 const BRANCH      = 'main';
-const TARGET_FILE = 'READLOG.md';
+const TARGET_FILE = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
 
 // ===== ARGS =====
 const [OWNER, REPO, TARGET_TXN_ID] = process.argv.slice(2);
@@ -47,114 +47,48 @@ function isTxn(item) {
   return item && typeof item.SK === 'string' && item.SK.startsWith('TXN#');
 }
 
-// Strict PR-block remover: remove only headings “## PR #<n>:”
-function removePrBlocks(readlog, prNumbers) {
-  if (!readlog) return '';
-  const prSet = new Set((prNumbers || []).filter(Boolean));
-  if (!prSet.size) return readlog;
+function renderRevertEntry({ owner, repo, target, prNumber, codeRevertCommitSha }) {
+  const date = new Date().toISOString().slice(0, 10);
+  const title = target.prTitle || `PR #${prNumber}`;
+  const prUrl = prNumber ? `https://github.com/${owner}/${repo}/pull/${prNumber}` : null;
 
-  const lines = readlog.split('\n');
-  const keep = [];
-  for (let i = 0; i < lines.length; ) {
-    const m = lines[i].match(/^##\s+PR\s+#(\d+)\b/);
-    if (m && prSet.has(m[1])) {
-      // skip until next PR heading or EOF
-      let j = i + 1;
-      while (j < lines.length && !/^##\s+PR\s+#\d+/.test(lines[j])) j++;
-      i = j; // removed this block
-    } else {
-      keep.push(lines[i]);
-      i++;
-    }
-  }
-  return keep.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+  return [
+    `## REVERT of PR #${prNumber}: ${title}`,
+    `*Reverted:* ${date} • *Original Merge:* ${target.prMergedAt || 'unknown'} • *Author:* ${target.prAuthor || 'unknown'}`,
+    ``,
+    `### Summary`,
+    `This entry documents a revert of the original change introduced by PR #${prNumber}. No prior changelog entries were removed; the log remains append-only.`,
+    ``,
+    `### What Changed`,
+    target.mergeCommitSha
+      ? `- Code reverted to the first parent of merge commit \`${target.mergeCommitSha}\` via new commit \`${codeRevertCommitSha || 'n/a'}\`.`
+      : `- Code revert did not specify a merge commit (nothing changed or handled manually).`,
+    `- Documentation: earlier entries remain intact; this entry records the revert.`,
+
+    ``,
+    `### Links`,
+    prUrl ? `- Original PR: ${prUrl}` : null,
+    target.mergeCommitSha ? `- Merge commit: \`${target.mergeCommitSha}\`` : null,
+    codeRevertCommitSha ? `- Revert commit: \`${codeRevertCommitSha}\`` : null,
+    ``,
+    `---`,
+    ``
+  ].filter(Boolean).join('\n');
 }
 
-async function fetchReadlog(owner, repo, path = TARGET_FILE, branch = BRANCH) {
+async function fetchChangelog(owner, repo, path = TARGET_FILE, branch = BRANCH) {
   try {
     const { data } = await octo.repos.getContent({ owner, repo, path, ref: branch });
     const sha = !Array.isArray(data) ? data.sha : undefined;
     const content = !Array.isArray(data) ? Buffer.from(data.content, 'base64').toString('utf8') : '';
     return { content, sha };
   } catch (e) {
-    if (e.status === 404) return { content: '# Release / Change Log\n\n', sha: undefined };
+    if (e.status === 404) return { content: '# Changelog\n\n', sha: undefined };
     throw e;
   }
 }
 
-async function commitReadlog(owner, repo, path, newContent, prevSha, message) {
-  const { data } = await octo.repos.createOrUpdateFileContents({
-    owner, repo, path,
-    message,
-    content: Buffer.from(newContent, 'utf8').toString('base64'),
-    branch: BRANCH,
-    ...(prevSha ? { sha: prevSha } : {})
-  });
-  return {
-    docsRevertCommitSha: data?.commit?.sha || null,
-    docFileSha: data?.content?.sha || null
-  };
-}
-
-// Git “revertish”: create a new commit whose tree equals the first parent of the merge commit
-async function revertMergeCommit(mergeCommitSha, label) {
-  const { data: refData } = await octo.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}` });
-  const tipSha = refData.object.sha;
-
-  const { data: target } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: mergeCommitSha });
-  if (!target.parents?.length) throw new Error('Target commit has no parents; cannot revert.');
-  const parentSha = target.parents[0].sha;
-
-  const { data: parent } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: parentSha });
-  const treeSha = parent.tree.sha;
-
-  const { data: newCommit } = await octo.git.createCommit({
-    owner: OWNER, repo: REPO,
-    message: `Revert: "${label || 'merge'}"\n\nThis reverts commit ${mergeCommitSha}.`,
-    tree: treeSha,
-    parents: [tipSha]
-  });
-  await octo.git.updateRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: newCommit.sha });
-  return newCommit.sha;
-}
-
-// Optional LLM cleanup (flash-first cascade to avoid pro quota)
-async function llmRewrite(original, prNumbers, relatedSummaries) {
-  if (!GEMINI_API_KEY) return null;
-  try {
-    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    const MODEL_CANDIDATES = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-1.0-pro'];
-    const prompt = `
-You are updating a monolithic changelog (READLOG.md).
-Remove ONLY the sections whose headings start with these exact markers:
-${prNumbers.map(n => `- ## PR #${n}:`).join('\n')}
-
-Also, if any follow-up "doc-only" entries explicitly listed below clearly reference those same PRs, remove them too.
-
-Doc-only notes:
-${(relatedSummaries || []).map(s => `- ${s}`).join('\n') || '(none)'}
-
-Return ONLY the final full file content (no fences).
----
-${original}
-`.trim();
-
-    for (const name of MODEL_CANDIDATES) {
-      try {
-        const model = genAI.getGenerativeModel({ model: name });
-        const result = await model.generateContent({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
-        });
-        const text = result?.response?.text?.();
-        if (text && text.trim()) return text.trimEnd() + (text.endsWith('\n') ? '' : '\n');
-      } catch (_) { /* try next */ }
-    }
-  } catch (_) {}
-  return null;
-}
-
-async function recordRevertTxn({ repoBranchId, target, docsRevertCommitSha, docFileSha, codeRevertCommitSha, newContent, prNumbers }) {
+async function recordRevertTxn({ repoBranchId, target, docsRevertCommitSha, docFileSha, codeRevertCommitSha, newSection, prNumbers }) {
   const newTxnSK = `TXN#${nowIso()}#REVERT`;
   const { Item: head } = await docClient.send(new GetCommand({ TableName: DYNAMO_TABLE, Key: { RepoBranch: repoBranchId, SK: 'HEAD' } }));
   const parentHead = head?.latestTxnSK || 'ROOT';
@@ -172,8 +106,8 @@ async function recordRevertTxn({ repoBranchId, target, docsRevertCommitSha, docF
     docFileSha: docFileSha || null,
     docsRevertCommitSha: docsRevertCommitSha || null,
     codeRevertCommitSha: codeRevertCommitSha || null,
-    docChangeType: 'UTF8_CONTENT_SHA256',
-    docChangeHash: sha256(newContent || '')
+    docChangeType: 'CHANGELOG_SECTION_SHA256',
+    docChangeHash: sha256(newSection || '')
   };
 
   await docClient.send(new TransactWriteCommand({
@@ -231,28 +165,20 @@ async function loadTargetAndRelated(owner, repo, targetTxnId) {
       console.log('ℹ️ No mergeCommitSha on target txn; skipping code revert.');
     }
 
-    // 2) Revert docs (READLOG.md)
-    const { content: currentReadlog, sha: prevSha } = await fetchReadlog(OWNER, REPO, TARGET_FILE, BRANCH);
-
-    // First, try strict heuristic (exact PR sections only)
-    let newContent = removePrBlocks(currentReadlog, prNumbersToRemove);
-
-    // If nothing changed (rare), optional LLM cleanup (flash-first cascade)
-    if (newContent.trim() === currentReadlog.trim()) {
-      const relatedSummaries = relatedDocOnly.map(x => x.message || x.summary || '').filter(Boolean).slice(0, 20);
-      const llmContent = await llmRewrite(currentReadlog, prNumbersToRemove, relatedSummaries);
-      if (llmContent && llmContent.trim() !== currentReadlog.trim()) {
-        newContent = llmContent;
-      }
-    }
-
-    if (newContent.trim() === currentReadlog.trim()) {
-      throw new Error('Docs rewriter produced no change; aborting to avoid no-op commit.');
-    }
+    // 2) Append a REVERT entry to the changelog (append-only, latest-first)
+    const { content: currentReadlog, sha: prevSha } = await fetchChangelog(OWNER, REPO, TARGET_FILE, BRANCH);
+    const section = renderRevertEntry({
+      owner: OWNER,
+      repo: REPO,
+      target,
+      prNumber,
+      codeRevertCommitSha
+    });
+    const newContent = [section, currentReadlog || '# Changelog\n\n'].join('\n');
 
     const { docsRevertCommitSha, docFileSha } = await commitReadlog(
       OWNER, REPO, TARGET_FILE, newContent, prevSha,
-      `docs(revert): remove PR #${prNumber} section(s) (revert ${target.SK})`
+      `docs(revert): add REVERT entry for PR #${prNumber} (revert ${target.SK})`
     );
     console.log(`✅ Docs reverted: ${docsRevertCommitSha}`);
 
@@ -263,7 +189,8 @@ async function loadTargetAndRelated(owner, repo, targetTxnId) {
       docsRevertCommitSha,
       docFileSha,
       codeRevertCommitSha,
-      newContent,
+      // store only the appended entry hash (like index.js)
+      newSection: section,
       prNumbers: prNumbersToRemove
     });
 

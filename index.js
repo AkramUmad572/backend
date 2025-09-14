@@ -309,7 +309,7 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     const section = renderChangelogEntry({ pr, commits, jira, llm });
 
     // === Append to CHANGELOG.md (append-only) ===
-    const PATH = 'CHANGELOG.md';
+    const PATH = process.env.DOC_LOG_FILE || 'CHANGELOG.md';
     const branch = pr.base?.ref || 'main';
     let existing = '';
     const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(PATH)}?ref=${encodeURIComponent(branch)}`;
