@@ -17,62 +17,60 @@ const DYNAMO_TABLE = process.env.DYNAMODB_TABLE_NAME;
 const dbClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const docClient = DynamoDBDocumentClient.from(dbClient);
 
-// --- GITHUB WEBHOOK ENDPOINT (AUTOMATION) ---
+// --- GITHUB WEBHOOK ENDPOINT ---
 app.post('/api/ingest', (req, res) => {
   const event = req.headers['x-github-event'];
   if (event === 'ping') return res.status(200).json({ message: 'Ping received' });
 
   if (event === 'push' && req.body.ref === 'refs/heads/main') {
     const { head_commit, repository } = req.body;
-    if (!head_commit || head_commit.message.includes(SKIP_FLAG)) {
-      const reason = !head_commit ? 'no head_commit' : 'bot commit detected';
-      console.log(`🚫 Ingest ignored: ${reason}.`);
-      return res.status(200).json({ message: `Ingest ignored: ${reason}` });
+    if (!head_commit) return res.status(200).json({ message: 'Push ignored (no head_commit).' });
+
+    // 1. Check for our own bot's commits to prevent loops
+    if (head_commit.message.includes(SKIP_FLAG)) {
+      console.log(`🚫 Bot commit detected. Ignoring to prevent loop.`);
+      return res.status(200).json({ message: 'Bot commit ignored.' });
     }
 
-    const prMatch = head_commit.message.match(/Merge pull request #(\d+)/);
-    if (!prMatch) {
-      console.log(`ℹ️ Push to main was not a PR merge. Ignoring.`);
-      return res.status(200).json({ message: 'Push was not a PR merge.' });
-    }
-
-    const prNumber = prMatch[1];
-    const sourceCommitSha = head_commit.id;
     const owner = repository.owner.login;
     const repo = repository.name;
 
-    console.log(`✅ Human PR #${prNumber} merged. Triggering AI documentation bot...`);
-    const command = `node index.js ${owner} ${repo} ${prNumber} ${sourceCommitSha}`;
-    exec(command, (error, stdout, stderr) => {
-      if (error) console.error(`❌ Error executing index.js: ${error.message}\n${stderr}`);
-      else console.log(`stdout from index.js:\n${stdout}`);
-    });
+    // 2. Check if this is a standard PR merge
+    const prMatch = head_commit.message.match(/Merge pull request #(\d+)/);
+    if (prMatch) {
+      const prNumber = prMatch[1];
+      const sourceCommitSha = head_commit.id;
+      console.log(`✅ Human PR #${prNumber} merged. Triggering AI documentation bot...`);
+      const command = `node index.js ${owner} ${repo} ${prNumber} ${sourceCommitSha}`;
+      exec(command, (error, stdout, stderr) => { /* ... error handling ... */ });
+      return res.status(202).json({ message: 'Accepted: AI documentation process started.' });
+    }
 
-    return res.status(202).json({ message: 'Accepted: AI documentation process started.' });
+    // --- 3. NEW LOGIC: DETECT A MANUAL "DOCS-ONLY" COMMIT ---
+    const changedFiles = [].concat(head_commit.added, head_commit.modified);
+    const isDocsOnlyChange = changedFiles.length > 0 && changedFiles.every(file => file.startsWith(DOCS_DIR + '/'));
+
+    if (isDocsOnlyChange) {
+      console.log(`📝 Manual "docs-only" commit detected. Recording transaction...`);
+      const author = head_commit.author.username;
+      const message = head_commit.message;
+      const commitSha = head_commit.id;
+
+      // Use JSON.stringify for safety
+      const command = `node process-manual-commit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${commitSha}`;
+      exec(command, (error, stdout, stderr) => {
+        if (error) console.error(`❌ Error processing manual commit: ${error.message}\n${stderr}`);
+        else console.log(`stdout from process-manual-commit.js:\n${stdout}`);
+      });
+      return res.status(202).json({ message: 'Accepted: Manual documentation commit detected and is being recorded.' });
+    }
+    // --------------------------------------------------------
+
+    console.log(`ℹ️ Push was not a PR merge or a docs-only commit. Ignoring.`);
+    return res.status(200).json({ message: 'Push ignored.' });
   }
 
   return res.status(200).json({ message: 'Event not processed.' });
-});
-
-// --- API ENDPOINT TO FETCH HISTORY (FOR YOUR DASHBOARD) ---
-app.get('/api/history/:owner/:repo', async (req, res) => {
-    const { owner, repo } = req.params;
-    const repoBranchId = `${owner}/${repo}#main`;
-
-    console.log(`▶️  Fetching history for ${repoBranchId}`);
-    try {
-        const command = new QueryCommand({
-            TableName: DYNAMO_TABLE,
-            KeyConditionExpression: 'RepoBranch = :rb',
-            ExpressionAttributeValues: { ':rb': repoBranchId },
-            ScanIndexForward: false, // Return newest items first
-        });
-        const { Items } = await docClient.send(command);
-        res.status(200).json(Items || []);
-    } catch (error) {
-        console.error(`❌ Failed to fetch history for ${repoBranchId}:`, error);
-        res.status(500).json({ error: 'Failed to fetch history from DynamoDB.' });
-    }
 });
 
 // --- API ENDPOINT FOR MANUAL EDITS (FROM YOUR DASHBOARD'S EDITOR) ---
