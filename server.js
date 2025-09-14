@@ -1,4 +1,4 @@
-// server.js (ESM) — FULL FILE with robust exec logging
+// server.js (ESM) — FULL FILE with robust exec logging + optional README processor
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -8,12 +8,15 @@ import { exec } from 'child_process';
 
 const app = express();
 
-// Middleware
+// ---- Config flags (environment) ----
+const READMEBOT_AUTO = String(process.env.READMEBOT_AUTO || '').toLowerCase() === 'true'; // default: off
+
+// ---- Middleware ----
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Small helper to stream child output so nothing goes “silent”
+// ---- Helper: stream child output so nothing goes “silent” ----
 function run(cmd, label) {
   console.log(`▶️  ${label}: ${cmd}`);
   const child = exec(cmd, { maxBuffer: 1024 * 1024 * 20, cwd: process.cwd(), env: process.env });
@@ -24,9 +27,9 @@ function run(cmd, label) {
   return child;
 }
 
-// Main webhook endpoint (GitHub → on PR merged)
-// ... keep existing imports, middleware, and run() helper ...
-
+// ------------------------------------------------------------
+// GitHub webhook entrypoint
+// ------------------------------------------------------------
 app.post('/api/ingest', (req, res) => {
   const event = req.headers['x-github-event'];
   const delivery = req.headers['x-github-delivery'];
@@ -40,23 +43,22 @@ app.post('/api/ingest', (req, res) => {
   // ✅ Handle docs-only pushes (auto "manual" transaction)
   if (event === 'push') {
     const payload = req.body;
-    const { head_commit, repository } = payload || {};
+    const { repository } = payload || {};
     if (!payload || !repository) {
       console.warn('⚠️ Malformed push payload.');
       return res.status(400).json({ error: 'Malformed payload' });
     }
 
-    // ignore bot/self commits that include [skip-docflow]
-    if (head_commit?.message?.includes('[skip-docflow]')) {
-      console.log('🚫 Bot commit detected. Ignoring to prevent loop.');
-      return res.status(200).json({ message: 'Bot commit ignored.' });
-    }
+    // Aggregate all changed files across commits, not just head_commit
+    const commits = Array.isArray(payload.commits) ? payload.commits : (payload.head_commit ? [payload.head_commit] : []);
+    const changedFiles = commits.flatMap(c => [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]);
 
-    const owner = repository.owner.login;
-    const repo = repository.name;
-    const added = head_commit?.added || [];
-    const modified = head_commit?.modified || [];
-    const changedFiles = [...added, ...modified];
+    // ignore bot/self commits that include [skip-docflow]
+    const hasSkipFlag = commits.some(c => (c.message || '').includes('[skip-docflow]'));
+    if (hasSkipFlag) {
+      console.log('🚫 Bot commit detected. Ignoring to prevent loop.');
+      return res.status(200).json({ message: 'Bot commit(s) ignored.' });
+    }
 
     // docs-only check
     const isDocsOnly = changedFiles.length > 0 && changedFiles.every(p => p.startsWith('docs/'));
@@ -65,9 +67,14 @@ app.post('/api/ingest', (req, res) => {
       return res.status(200).json({ message: 'Push ignored (not docs-only).' });
     }
 
-    const author = head_commit?.author?.username || head_commit?.author?.name || 'unknown';
-    const message = head_commit?.message || '';
-    const commitSha = head_commit?.id;
+    const owner = repository.owner?.login;
+    const repo = repository.name;
+
+    // Use the last commit for author/message/sha context
+    const last = commits[commits.length - 1] || payload.head_commit || {};
+    const author = last.author?.username || last.author?.name || 'unknown';
+    const message = last.message || '';
+    const commitSha = last.id;
 
     console.log(`📝 Docs-only push detected on ${owner}/${repo} @ ${commitSha?.slice(0,7)} — recording manual txn...`);
 
@@ -78,61 +85,95 @@ app.post('/api/ingest', (req, res) => {
     return res.status(202).json({ message: 'Accepted: docs-only push processed.', commit: commitSha });
   }
 
-  // Enhanced pull_request flow (generate READLOG and README on merge)
+  // Enhanced pull_request flow (generate READLOG on merge; README processor is opt-in)
   if (event === 'pull_request') {
     // Handle both JSON and form-encoded payloads
     let payload = req.body;
-    if (req.body.payload) {
-      // GitHub sends form-encoded data with JSON in 'payload' field
-      payload = JSON.parse(req.body.payload);
+    if (req.body && req.body.payload) {
+      // GitHub can send form-encoded data with JSON in 'payload' field
+      try { payload = JSON.parse(req.body.payload); } catch { /* ignore */ }
     }
-    
-    const { action, pull_request, repository } = payload;
+
+    const { action, pull_request, repository } = payload || {};
     if (!pull_request || !repository) {
       console.warn('⚠️ Malformed pull_request payload.');
       return res.status(400).json({ error: 'Malformed payload' });
     }
 
     console.log(`PR Event: ${action} - PR #${pull_request.number}`);
-    console.log(`PR Details: closed=${pull_request.closed}, closed_at=${pull_request.closed_at}, state=${pull_request.state}`);
+    console.log(`PR Details: merged=${pull_request.merged} closed=${pull_request.closed} state=${pull_request.state}`);
 
-    // Trigger when PR is closed (assuming it was merged since we can't distinguish)
-    if (action === 'closed' && pull_request.state === 'closed') {
-      console.log(`🎉 PR #${pull_request.number} was closed! Triggering changelog update...`);
-
+    // Trigger when PR is merged (GitHub sends action=closed with merged=true)
+    if (action === 'closed' && pull_request.merged) {
       const owner = repository.owner.login;
       const repo = repository.name;
       const prNumber = pull_request.number;
 
-      // Execute both changelog and README processing
+      console.log(`🎉 PR #${prNumber} was merged! Triggering changelog update...`);
       run(`node index.js ${owner} ${repo} ${prNumber}`, `READLOG-${prNumber}`);
-      run(`node readme-processor.js ${owner} ${repo} ${prNumber}`, `README-${prNumber}`);
+
+      // README processor — opt-in only:
+      //   1) Env flag READMEBOT_AUTO=true, OR
+      //   2) PR has label "readme-bot", OR
+      //   3) PR title/body contains "[readme-bot]"
+      const labels = Array.isArray(pull_request.labels) ? pull_request.labels.map(l => l.name?.toLowerCase?.()) : [];
+      const title = (pull_request.title || '').toLowerCase();
+      const body  = (pull_request.body  || '').toLowerCase();
+      const wantsReadme =
+        READMEBOT_AUTO ||
+        labels.includes('readme-bot') ||
+        title.includes('[readme-bot]') ||
+        body.includes('[readme-bot]');
+
+      if (wantsReadme) {
+        console.log('🧾 README processor enabled for this PR (flag/label/marker matched).');
+        run(`node readme-processor.js ${owner} ${repo} ${prNumber}`, `README-${prNumber}`);
+      } else {
+        console.log('🧾 README processor skipped (no opt-in).');
+      }
 
       return res.status(202).json({
-        message: 'Accepted: PR close event received and changelog generation process started.',
-        prNumber: prNumber,
+        message: 'Accepted: PR merge event received; changelog generation started.',
+        prNumber
       });
-    } else {
-      console.log(`ℹ️  PR #${pull_request.number} was ${action} but not closed. No action taken.`);
-      return res.status(200).json({ message: 'Event received but not a close action.' });
     }
+
+    console.log(`ℹ️  PR #${pull_request.number} was ${action} but not a merge. No action taken.`);
+    return res.status(200).json({ message: 'Event received but not a merge.' });
   }
 
   console.log(`ℹ️  Received unhandled event: ${event}`);
   return res.status(200).json({ message: `Event ${event} received but not handled.` });
 });
 
+// ------------------------------------------------------------
+// Manual single-file edit (dashboard) → calls manual-edit.js
+// ------------------------------------------------------------
 app.post('/api/manual-edit', (req, res) => {
   const { owner, repo, author, message, filePath, newContent } = req.body || {};
   if (!owner || !repo || !author || !message || !filePath || typeof newContent !== 'string') {
     return res.status(400).json({ error: 'owner, repo, author, message, filePath, newContent are required' });
   }
-  // Safely quote args that may contain spaces/newlines
   const cmd = `node manual-edit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${JSON.stringify(filePath)} ${JSON.stringify(newContent)}`;
   run(cmd, `manual-edit ${owner}/${repo}:${filePath}`);
   return res.status(202).json({ ok: true, owner, repo, filePath });
 });
 
+// ------------------------------------------------------------
+// Manual README processor trigger (optional, on-demand)
+// ------------------------------------------------------------
+app.post('/api/readme-process', (req, res) => {
+  const { owner, repo, prNumber } = req.body || {};
+  if (!owner || !repo || !prNumber) {
+    return res.status(400).json({ error: 'owner, repo, prNumber are required' });
+  }
+  run(`node readme-processor.js ${owner} ${repo} ${prNumber}`, `README-${prNumber}`);
+  return res.status(202).json({ ok: true, owner, repo, prNumber });
+});
+
+// ------------------------------------------------------------
+// Revert endpoint
+// ------------------------------------------------------------
 app.post('/api/revert', (req, res) => {
   const { owner, repo, transactionId } = req.body || {};
   if (!owner || !repo || !transactionId) {
@@ -142,8 +183,8 @@ app.post('/api/revert', (req, res) => {
   const cmd = `node revert.js ${owner} ${repo} "${transactionId}"`;
   console.log(`▶️  Revert request: ${cmd}`);
 
-  const child = run(cmd, `revert ${transactionId}`);
-  res.status(202).json({
+  run(cmd, `revert ${transactionId}`);
+  return res.status(202).json({
     message: 'Accepted: revert process started.',
     owner,
     repo,
@@ -151,7 +192,9 @@ app.post('/api/revert', (req, res) => {
   });
 });
 
-// Manual trigger endpoint (for PR + JIRA ticket)
+// ------------------------------------------------------------
+// Manual PR ingest trigger (optionally with jiraKey)
+// ------------------------------------------------------------
 app.post('/api/manual-ingest', (req, res) => {
   const { owner, repo, prNumber, jiraKey } = req.body || {};
   if (!owner || !repo || !prNumber) {
@@ -161,27 +204,26 @@ app.post('/api/manual-ingest', (req, res) => {
   const cmd = `node index.js ${owner} ${repo} ${prNumber}${jiraKey ? ` ${jiraKey}` : ''}`;
   console.log(`▶️  Manual ingest: ${cmd}`);
 
-  const child = run(cmd, `manual index.js PR#${prNumber}`);
-  // Respond immediately; logs stream to server output
-  res.status(200).json({ ok: true, prNumber, jiraKey: jiraKey || null });
+  run(cmd, `manual index.js PR#${prNumber}`);
+  return res.status(202).json({ ok: true, prNumber, jiraKey: jiraKey || null });
 });
 
-// Health check endpoint
+// ------------------------------------------------------------
+// Health + Root
+// ------------------------------------------------------------
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Root endpoint
 app.get('/', (req, res) => {
-  res.json({
-    message: 'DocFlow API Webhook Server is running',
-  });
+  res.json({ message: 'DocFlow API Webhook Server is running' });
 });
 
+// ------------------------------------------------------------
+// Boot
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 DocFlow API Webhook Server running on port ${PORT}`);
+  console.log(`ℹ️  README auto mode: ${READMEBOT_AUTO ? 'ENABLED' : 'DISABLED'} (toggle with READMEBOT_AUTO=true)`);
 });
