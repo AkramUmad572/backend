@@ -53,6 +53,24 @@ function isoDateOnly(s) {
   try { return (new Date(s)).toISOString().slice(0,10); } catch { return 'unknown'; }
 }
 
+// Remove any existing block for this PR to make the write idempotent
+function stripExistingPrSection(markdown, prNumber) {
+  if (!markdown) return '';
+  const lines = markdown.split('\n');
+  const keep = [];
+  for (let i = 0; i < lines.length; ) {
+    const m = lines[i].match(/^##\s+PR\s+#(\d+)\b/);
+    if (m && String(prNumber) === m[1]) {
+      let j = i + 1;
+      while (j < lines.length && !/^##\s+PR\s+#\d+/.test(lines[j])) j++;
+      i = j; // drop existing PR block
+    } else {
+      keep.push(lines[i]); i++;
+    }
+  }
+  return keep.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+}
+
 // -------------------- CLIENTS --------------------
 const dbClient = new DynamoDBClient({ region: AWS_REGION });
 const docClient = DynamoDBDocumentClient.from(dbClient);
@@ -163,8 +181,6 @@ async function getJiraIssue(jiraKey) {
     }
   }
 
-  const botDocCommitSha = writeResult?.commit?.sha || null;
-
   return {
     key: data?.key,
     summary: data?.fields?.summary || 'No summary',
@@ -173,8 +189,6 @@ async function getJiraIssue(jiraKey) {
     issueType: data?.fields?.issuetype?.name || 'Task',
     assignee: data?.fields?.assignee?.displayName || 'Unassigned',
     reporter: data?.fields?.reporter?.displayName || 'Unknown',
-    docFileSha: writeResult?.content?.sha || null,
-    botDocCommitSha,
     description
   };
 }
@@ -329,6 +343,9 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
       existing = '# Release / Change Log\n\n';
     }
 
+    // Remove any existing PR block before adding a fresh one
+    existing = stripExistingPrSection(existing, pr.number);
+
     const newContent = [section, existing].join('\n');
     const writeResult = await upsertFile({
       owner, repo,
@@ -358,6 +375,9 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     const parentChangeHash = sha256(prDiff || '');
     const docChangeHash = sha256(section || '');
     const conceptKey = jira?.key ? `JIRA:${jira.key}` : `PR#${prNumber}`;
+
+    const botDocCommitSha = writeResult?.commit?.sha || null;
+    const docFileSha      = writeResult?.content?.sha || null;
 
     const txnItem = {
       RepoBranch: repoBranchId,
@@ -389,7 +409,8 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
 
       // Pointers to artifacts
       docFilePath: PATH,
-      docFileSha: writeResult?.content?.sha || null,
+      docFileSha,
+      botDocCommitSha,
 
       // For convenience
       summaryPreview: truncate(section, 400)
