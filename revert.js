@@ -1,4 +1,4 @@
-// revert.js (ESM) — Semantic revert with conceptKey roundup (PAIR + subsequent DOC_ONLY) for READLOG.md
+// revert.js (ESM) — Semantic revert with code + docs, and conceptKey roundup
 import 'dotenv/config';
 import { Octokit } from '@octokit/rest';
 import { Buffer } from 'node:buffer';
@@ -15,19 +15,19 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 
 // -------------------- ENV & CONSTS --------------------
-const AWS_REGION   = process.env.AWS_REGION || 'us-east-1';
-const DYNAMO_TABLE = process.env.DYNAMODB_TABLE_NAME;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const AWS_REGION     = process.env.AWS_REGION || 'us-east-1';
+const DYNAMO_TABLE   = process.env.DYNAMODB_TABLE_NAME;
+const GITHUB_TOKEN   = process.env.GITHUB_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_API_TOKEN;
 
-const BRANCH = 'main';
-const TARGET_FILE = 'READLOG.md'; // Primary doc we rewrite
+const BRANCH      = 'main';
+const TARGET_FILE = 'READLOG.md'; // primary doc we rewrite
 
 // -------------------- ARGS --------------------
 const [OWNER, REPO, TARGET_TXN_ID] = process.argv.slice(2);
 if (!OWNER || !REPO || !TARGET_TXN_ID) {
   console.error('Usage: node revert.js <owner> <repo> <targetTransactionId>');
-  console.error('Example: node revert.js jwlebert htn25-test "TXN#2025-09-14T02:06:25.774Z#PR#42"');
+  console.error('Example: node revert.js jwlebert htn25-test "TXN#2025-09-14T02:06:25.774Z#PR#4"');
   process.exit(1);
 }
 
@@ -38,42 +38,29 @@ const docClient = DynamoDBDocumentClient.from(dbClient);
 
 // -------------------- UTILS --------------------
 const sha256 = (s) => crypto.createHash('sha256').update(s || '', 'utf8').digest('hex');
+const nowIso = () => new Date().toISOString();
 
 function ensureEnv(varName, val) {
   if (!val) throw new Error(`Missing required env var: ${varName}`);
 }
-
-function parseMaybeJson(x) {
-  try { return typeof x === 'string' ? JSON.parse(x) : x; } catch { return x; }
-}
-
 function isTxn(item) {
   return item && typeof item.SK === 'string' && item.SK.startsWith('TXN#');
 }
-
-function compareIso(a, b) {
-  // returns true if a > b (both ISO strings)
+function compareIsoGT(a, b) {
   try { return new Date(a).getTime() > new Date(b).getTime(); } catch { return false; }
 }
-
-function unique(arr) {
-  return Array.from(new Set(arr));
-}
+function unique(arr) { return Array.from(new Set(arr)); }
 
 // Fallback surgical remover if LLM is unavailable: removes blocks starting at headings "## PR #<n>:" or lines mentioning concept
 function removeConceptBlocksHeuristic(original, { prNumber, conceptKey, extraPhrases = [] }) {
   if (!original) return original || '';
-
   const lines = original.split('\n');
   const toRemoveIdx = new Set();
 
-  // Identify ranges that start with "## PR #<n>:" for the target PR
   const headingPattern = prNumber ? new RegExp(`^##\\s+PR\\s+#${prNumber}\\b`) : null;
 
-  // We'll also remove lines that explicitly mention the conceptKey (e.g., JIRA: ABC-123) or extra phrases
   const mentionPatterns = [];
   if (conceptKey) {
-    // Concept keys look like "JIRA:ABC-123" or "PR#42"
     const c = String(conceptKey).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     mentionPatterns.push(new RegExp(c, 'i'));
   }
@@ -82,12 +69,11 @@ function removeConceptBlocksHeuristic(original, { prNumber, conceptKey, extraPhr
     if (p) mentionPatterns.push(new RegExp(p, 'i'));
   }
 
-  // Pass 1: mark complete PR blocks by heading
+  // Remove whole PR block
   if (headingPattern) {
     let i = 0;
     while (i < lines.length) {
       if (headingPattern.test(lines[i])) {
-        // remove until next "## PR #" or end
         let j = i + 1;
         while (j < lines.length && !/^##\s+PR\s+#\d+/.test(lines[j])) j++;
         for (let k = i; k < j; k++) toRemoveIdx.add(k);
@@ -98,21 +84,17 @@ function removeConceptBlocksHeuristic(original, { prNumber, conceptKey, extraPhr
     }
   }
 
-  // Pass 2: remove scattered lines mentioning the concept, small context window
+  // Remove scattered concept mentions (with small context)
   for (let i = 0; i < lines.length; i++) {
     if (mentionPatterns.some(rx => rx.test(lines[i]))) {
-      // remove up to 5 lines around the mention to catch bullet blocks
       for (let k = Math.max(0, i - 2); k <= Math.min(lines.length - 1, i + 5); k++) {
         toRemoveIdx.add(k);
       }
     }
   }
 
-  // Build result, also collapse multiple blank lines
   const kept = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (!toRemoveIdx.has(i)) kept.push(lines[i]);
-  }
+  for (let i = 0; i < lines.length; i++) if (!toRemoveIdx.has(i)) kept.push(lines[i]);
   const collapsed = kept.join('\n').replace(/\n{3,}/g, '\n\n');
   return collapsed.trimEnd() + '\n';
 }
@@ -122,7 +104,6 @@ async function getTargetTxnAndRelated({ owner, repo, targetTxnId }) {
   ensureEnv('DYNAMODB_TABLE_NAME', DYNAMO_TABLE);
   const repoBranchId = `${owner}/${repo}#${BRANCH}`;
 
-  // 1) Load target txn
   const { Item: target } = await docClient.send(new GetCommand({
     TableName: DYNAMO_TABLE,
     Key: { RepoBranch: repoBranchId, SK: targetTxnId }
@@ -130,25 +111,21 @@ async function getTargetTxnAndRelated({ owner, repo, targetTxnId }) {
   if (!target) throw new Error(`Transaction not found: ${targetTxnId}`);
   if (!isTxn(target)) throw new Error(`Key is not a transaction: ${targetTxnId}`);
 
-  // 2) Round up later DOC_ONLY txns with matching conceptKey
-  const createdAt = target.createdAt || target.timestamp || null;
+  const createdAt  = target.createdAt || target.timestamp || null;
   const conceptKey = target.conceptKey || null;
 
   let related = [];
   if (conceptKey && createdAt) {
-    // Query all TXN# for this branch; DynamoDB can't filter "after ISO" server-side without sort schema,
-    // so we fetch and filter client-side.
     const q = await docClient.send(new QueryCommand({
       TableName: DYNAMO_TABLE,
       KeyConditionExpression: 'RepoBranch = :rb AND begins_with(#sk, :p)',
       ExpressionAttributeNames: { '#sk': 'SK' },
       ExpressionAttributeValues: { ':rb': repoBranchId, ':p': 'TXN#' }
     }));
-
     related = (q.Items || []).filter(isTxn).filter(it =>
       it.txnKind === 'DOC_ONLY' &&
       it.conceptKey === conceptKey &&
-      it.createdAt && compareIso(it.createdAt, createdAt)
+      it.createdAt && compareIsoGT(it.createdAt, createdAt)
     ).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
   }
 
@@ -178,39 +155,73 @@ async function commitReadlog(owner, repo, path, newContent, prevSha, message) {
     ...(prevSha ? { sha: prevSha } : {})
   });
   const commitSha = data?.commit?.sha || null;
-  const fileSha = data?.content?.sha || null;
+  const fileSha   = data?.content?.sha || null;
   return { commitSha, fileSha };
 }
 
+// -------------------- CODE REVERT --------------------
+async function revertGitCommit(mergeCommitSha, prTitle) {
+  console.log(`Attempting to revert Git commit: ${mergeCommitSha}`);
+  try {
+    // Current branch tip
+    const { data: refData } = await octo.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}` });
+    const tipSha = refData.object.sha;
+
+    // The merge commit we want to revert
+    const { data: commitToRevert } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: mergeCommitSha });
+    if (!commitToRevert.parents?.length) {
+      throw new Error('Target commit has no parents; cannot revert.');
+    }
+
+    // Use the first parent’s tree as a practical revert target (approximation of "git revert")
+    const baseParentSha = commitToRevert.parents[0].sha;
+    const { data: parentCommit } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: baseParentSha });
+    const treeSha = parentCommit.tree.sha;
+
+    const { data: newCommit } = await octo.git.createCommit({
+      owner: OWNER,
+      repo: REPO,
+      message: `Revert: "${prTitle || '(PR)'}"\n\nThis reverts commit ${mergeCommitSha}.`,
+      tree: treeSha,
+      parents: [tipSha]
+    });
+
+    await octo.git.updateRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: newCommit.sha });
+    console.log(`✅ Code revert commit created: ${newCommit.sha}`);
+    return newCommit.sha;
+  } catch (err) {
+    console.error('❌ Code revert failed:', err.message || err);
+    throw new Error('Git code revert operation failed (permissions/conflicts or non-merge history).');
+  }
+}
+
 // -------------------- LLM --------------------
-async function llmRewriteReadlog({ original, target, conceptKey, relatedDocOnly, owner, repo }) {
+async function llmRewriteReadlog({ original, target, conceptKey, relatedDocOnly }) {
   if (!GEMINI_API_KEY) return null;
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-    const prNumber = target.prNumber || null;
-    const prTitle  = target.prTitle  || null;
-    const docOnlyBullets = (relatedDocOnly || []).map(x => `- ${x.message || '(no message)'} @ ${x.createdAt || ''}`).slice(0, 20).join('\n');
+    const docOnlyBullets = (relatedDocOnly || [])
+      .map(x => `- ${x.message || '(no message)'} @ ${x.createdAt || ''}`)
+      .slice(0, 20)
+      .join('\n');
 
     const prompt = `
 You are an expert technical writer performing a *semantic revert* in a monolithic changelog file named READLOG.md.
 
-Current READLOG.md content (truncated may be long):
+Current READLOG.md content:
 ---
 ${original}
 ---
 
-The feature concept to remove is identified by:
+Remove the entire concept identified by:
 - conceptKey: ${conceptKey || '(none)'}
-- Primary PR: ${prNumber ? `#${prNumber}` : '(unknown)'} ${prTitle ? '— ' + prTitle : ''}
-- Additional doc-only edits to also remove (later patches of the same concept):
+- Primary PR: #${target.prNumber || '(unknown)'} — ${target.prTitle || ''}
+
+Also remove *later doc-only edits* of the same concept:
 ${docOnlyBullets || '(none)'}
 
-Your task:
-1) Remove the *entire* concept introduced by the Primary PR and any *subsequent doc-only edits* listed above.
-2) Preserve every other unrelated change.
-3) Keep the file well-formed markdown. Do *not* add explanation; output the full new file content.
-4) Output ONLY the raw file contents for READLOG.md (no code fences).
+Preserve all unrelated changes. Output ONLY the full, final file contents (no fences).
     `.trim();
 
     const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
@@ -226,33 +237,39 @@ Your task:
   return null;
 }
 
-// -------------------- DYNAMO RECORD --------------------
-async function recordRevertTxn({ repoBranchId, target, relatedDocOnly, conceptKey, docFileSha, botCommitSha, newContent }) {
+// -------------------- RECORD REVERT TXN --------------------
+async function recordRevertTxn({ repoBranchId, target, relatedDocOnly, conceptKey, docFileSha, docsRevertCommitSha, codeRevertCommitSha, newContent }) {
   if (!DYNAMO_TABLE) {
     console.warn('⚠️ DYNAMODB_TABLE_NAME not set; skipping REVERT txn record.');
     return;
   }
-  const newTxnSK = `TXN#${new Date().toISOString()}#REVERT`;
+  const newTxnSK = `TXN#${nowIso()}#REVERT`;
 
-  const relatedIds = relatedDocOnly.map(r => r.SK);
+  const { Item: head } = await docClient.send(new GetCommand({
+    TableName: DYNAMO_TABLE, Key: { RepoBranch: repoBranchId, SK: 'HEAD' }
+  }));
+  const parentHead = head?.latestTxnSK || 'ROOT';
+
   const item = {
     RepoBranch: repoBranchId,
     SK: newTxnSK,
-    parentTxnSK: (await getHead(repoBranchId)) || 'ROOT',
+    parentTxnSK: parentHead,
     type: 'REVERT',
     txnKind: 'REVERT',
-    createdAt: new Date().toISOString(),
+    createdAt: nowIso(),
 
     revertedTxnSK: target.SK,
-    alsoRemovedTxnSKs: relatedIds,
+    alsoRemovedTxnSKs: (relatedDocOnly || []).map(r => r.SK),
 
     conceptKey: conceptKey || null,
     docFilePath: TARGET_FILE,
     docFileSha: docFileSha || null,
-    botCommitSha: botCommitSha || null,
 
-    parentChangeHash: null,
-    parentChangeType: null,
+    // New commits created by this revert
+    codeRevertCommitSha: codeRevertCommitSha || null,
+    docsRevertCommitSha: docsRevertCommitSha || null,
+
+    // Hash of final doc content
     docChangeHash: sha256(newContent || ''),
     docChangeType: 'UTF8_CONTENT_SHA256'
   };
@@ -260,19 +277,11 @@ async function recordRevertTxn({ repoBranchId, target, relatedDocOnly, conceptKe
   await docClient.send(new TransactWriteCommand({
     TransactItems: [
       { Put: { TableName: DYNAMO_TABLE, Item: item } },
-      { Put: { TableName: DYNAMO_TABLE, Item: { RepoBranch: repoBranchId, SK: 'HEAD', latestTxnSK: newTxnSK, updatedAt: new Date().toISOString() } } }
+      { Put: { TableName: DYNAMO_TABLE, Item: { RepoBranch: repoBranchId, SK: 'HEAD', latestTxnSK: newTxnSK, updatedAt: nowIso() } } }
     ]
   }));
 
-  console.log(`🧾 Recorded REVERT transaction ${newTxnSK} (reverted=${target.SK}${relatedIds.length ? ` + ${relatedIds.length} doc-only` : ''})`);
-}
-
-async function getHead(repoBranchId) {
-  const { Item } = await docClient.send(new GetCommand({
-    TableName: DYNAMO_TABLE,
-    Key: { RepoBranch: repoBranchId, SK: 'HEAD' }
-  }));
-  return Item?.latestTxnSK || null;
+  console.log(`🧾 Recorded REVERT transaction ${newTxnSK} (reverted=${target.SK}${(item.alsoRemovedTxnSKs || []).length ? ` + ${item.alsoRemovedTxnSKs.length} doc-only` : ''})`);
 }
 
 // -------------------- MAIN --------------------
@@ -292,20 +301,25 @@ async function getHead(repoBranchId) {
       console.log('ℹ️  No related DOC_ONLY patches found (or conceptKey missing).');
     }
 
-    // 1) Load current READLOG.md
-    const { content: originalReadlog, sha: prevSha } = await fetchReadlog(OWNER, REPO, TARGET_FILE, BRANCH);
+    // 1) Revert CODE (if we have a PR merge commit SHA)
+    let codeRevertCommitSha = null;
+    if (target.mergeCommitSha) {
+      codeRevertCommitSha = await revertGitCommit(target.mergeCommitSha, target.prTitle || '(no title)');
+    } else {
+      console.log('ℹ️  No mergeCommitSha on target txn; skipping code revert.');
+    }
 
-    // 2) Try LLM rewrite; fallback to heuristics if unavailable
+    // 2) Revert DOCS (READLOG) — LLM or heuristic rewrite
+    const { content: currentReadlog, sha: prevSha } = await fetchReadlog(OWNER, REPO, TARGET_FILE, BRANCH);
+
     const llmNew = await llmRewriteReadlog({
-      original: originalReadlog,
+      original: currentReadlog,
       target,
       conceptKey,
-      relatedDocOnly,
-      owner: OWNER,
-      repo: REPO
+      relatedDocOnly
     });
 
-    const newContent = llmNew || removeConceptBlocksHeuristic(originalReadlog, {
+    const newContent = llmNew || removeConceptBlocksHeuristic(currentReadlog, {
       prNumber: target.prNumber || null,
       conceptKey,
       extraPhrases: unique([
@@ -314,29 +328,29 @@ async function getHead(repoBranchId) {
       ]).filter(Boolean)
     });
 
-    if (!newContent || newContent.trim() === originalReadlog.trim()) {
+    if (!newContent || newContent.trim() === currentReadlog.trim()) {
       throw new Error('Rewriter produced no changes; aborting to avoid no-op commit.');
     }
 
-    // 3) Commit updated READLOG.md
     const commitMsg = `docs(revert): remove concept ${conceptKey || target.prNumber || '(unknown)'} (revert ${target.SK})`;
-    const { commitSha: botCommitSha, fileSha: docFileSha } =
+    const { commitSha: docsRevertCommitSha, fileSha: docFileSha } =
       await commitReadlog(OWNER, REPO, TARGET_FILE, newContent, prevSha, commitMsg);
 
-    console.log(`✅ Pushed revert commit ${botCommitSha} updating ${TARGET_FILE} (sha ${docFileSha})`);
+    console.log(`✅ Pushed docs revert commit ${docsRevertCommitSha} updating ${TARGET_FILE} (sha ${docFileSha})`);
 
-    // 4) Record REVERT transaction in DynamoDB
+    // 3) Record REVERT transaction
     await recordRevertTxn({
       repoBranchId,
       target,
       relatedDocOnly,
       conceptKey,
       docFileSha,
-      botCommitSha,
+      docsRevertCommitSha,
+      codeRevertCommitSha,
       newContent
     });
 
-    console.log('\n✨ Semantic revert completed successfully.');
+    console.log('\n✨ Revert completed (code + docs).');
   } catch (error) {
     console.error(`\n❌ Revert failed: ${error.message}`);
     process.exit(1);

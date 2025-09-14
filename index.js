@@ -163,6 +163,8 @@ async function getJiraIssue(jiraKey) {
     }
   }
 
+  const botDocCommitSha = writeResult?.commit?.sha || null;
+
   return {
     key: data?.key,
     summary: data?.fields?.summary || 'No summary',
@@ -171,6 +173,8 @@ async function getJiraIssue(jiraKey) {
     issueType: data?.fields?.issuetype?.name || 'Task',
     assignee: data?.fields?.assignee?.displayName || 'Unassigned',
     reporter: data?.fields?.reporter?.displayName || 'Unknown',
+    docFileSha: writeResult?.content?.sha || null,
+    botDocCommitSha,
     description
   };
 }
