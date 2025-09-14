@@ -342,13 +342,17 @@ app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
 // ------------------------------------------------------------
 // Doc History endpoint - Get full history of a doc file
 // ------------------------------------------------------------
-app.get('/api/doc-history/:owner/:repo/*', async (req, res) => {
+app.get('/api/doc-history', async (req, res) => {
   try {
-    const { owner, repo } = req.params;
-    const filePath = decodeURIComponent(req.params[0] || ''); // <- catch-all
-    if (!filePath) return res.status(400).json({ error: 'filePath required' });
+    const owner   = req.query.owner;
+    const repo    = req.query.repo;
+    const filePath = req.query.filePath ? decodeURIComponent(req.query.filePath) : '';
+    const branch   = req.query.branch || 'main';
 
-    const branch = req.query.branch || 'main';
+    if (!owner || !repo || !filePath) {
+      return res.status(400).json({ error: 'owner, repo, and filePath are required' });
+    }
+
     const repoBranchId = `${owner}/${repo}#${branch}`;
 
     const { Items = [] } = await docClient.send(new QueryCommand({
@@ -359,7 +363,7 @@ app.get('/api/doc-history/:owner/:repo/*', async (req, res) => {
 
     const fileHistory = Items
       .filter(txn => (txn.docFilePath === filePath || txn.filePath === filePath))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // newest first
 
     const versions = await Promise.all(fileHistory.map(async (txn) => {
       let content = null;
