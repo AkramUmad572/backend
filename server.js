@@ -339,10 +339,10 @@ app.get('/api/changelog/:owner/:repo/content', async (req, res) => {
 // ------------------------------------------------------------
 // Doc History endpoint - Get full history of a doc file
 // ------------------------------------------------------------
-app.get('/api/doc-history/:owner/:repo/:filePath(.*)', async (req, res) => {
+app.get('/api/doc-history/:owner/:repo/:filePath*', async (req, res) => {
   try {
     const { owner, repo } = req.params;
-    // decode because file paths will often be URL-encoded
+    // filePath will include slashes; decode in case it was URL-encoded
     const filePath = decodeURIComponent(req.params.filePath || '');
     const branch = req.query.branch || 'main';
     const repoBranchId = `${owner}/${repo}#${branch}`;
