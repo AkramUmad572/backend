@@ -122,6 +122,17 @@ app.post('/api/ingest', (req, res) => {
   return res.status(200).json({ message: `Event ${event} received but not handled.` });
 });
 
+app.post('/api/manual-edit', (req, res) => {
+  const { owner, repo, author, message, filePath, newContent } = req.body || {};
+  if (!owner || !repo || !author || !message || !filePath || typeof newContent !== 'string') {
+    return res.status(400).json({ error: 'owner, repo, author, message, filePath, newContent are required' });
+  }
+  // Safely quote args that may contain spaces/newlines
+  const cmd = `node manual-edit.js ${owner} ${repo} ${JSON.stringify(author)} ${JSON.stringify(message)} ${JSON.stringify(filePath)} ${JSON.stringify(newContent)}`;
+  run(cmd, `manual-edit ${owner}/${repo}:${filePath}`);
+  return res.status(202).json({ ok: true, owner, repo, filePath });
+});
+
 app.post('/api/revert', (req, res) => {
   const { owner, repo, transactionId } = req.body || {};
   if (!owner || !repo || !transactionId) {

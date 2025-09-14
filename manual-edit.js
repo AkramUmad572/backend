@@ -1,5 +1,6 @@
-// manual-edit.js
+// manual-edit.js — dashboard edit (single file) → DynamoDB DOC_ONLY transaction (one hash)
 import 'dotenv/config';
+import crypto from 'crypto';
 import { Octokit } from '@octokit/rest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, TransactWriteCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
@@ -11,14 +12,27 @@ if (!OWNER || !REPO || !AUTHOR || !MESSAGE || !FILE_PATH || !NEW_CONTENT) {
 }
 const BRANCH = 'main';
 const SKIP_FLAG = '[skip-docflow]';
-const octo = new Octokit({ auth: process.env.GITHUB_TOKEN });
-const dbClient = new DynamoDBClient({ region: process.env.AWS_REGION });
-const docClient = DynamoDBDocumentClient.from(dbClient);
+const AWS_REGION   = process.env.AWS_REGION || 'us-east-1';
 const DYNAMO_TABLE = process.env.DYNAMODB_TABLE_NAME;
+
+const sha256 = (s) => crypto.createHash('sha256').update(s || '', 'utf8').digest('hex');
+
+function extractConceptKeyFromMessage(msg) {
+  if (!msg) return null;
+  const jira = msg.match(/([A-Z]{2,10}-\d+)/)?.[1];
+  if (jira) return `JIRA:${jira}`;
+  const pr = msg.match(/PR\s*#?(\d+)|pull\s*request\s*#?(\d+)/i);
+  if (pr) return `PR#${pr[1] || pr[2]}`;
+  return null;
+}
+
+const octo = new Octokit({ auth: process.env.GITHUB_TOKEN });
+const dbClient = new DynamoDBClient({ region: AWS_REGION });
+const docClient = DynamoDBDocumentClient.from(dbClient);
 
 (async () => {
   try {
-    // 1. Create a new commit with the manual changes
+    // 1) Create a new commit with the manual changes
     const { data: refData } = await octo.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${BRANCH}` });
     const { data: latestCommit } = await octo.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: refData.object.sha });
     const { data: blob } = await octo.git.createBlob({ owner: OWNER, repo: REPO, content: NEW_CONTENT, encoding: 'utf-8' });
@@ -34,21 +48,40 @@ const DYNAMO_TABLE = process.env.DYNAMODB_TABLE_NAME;
     const manualCommitSha = newCommit.sha;
     console.log(`✅ Pushed manual commit: ${manualCommitSha}`);
 
-    // 2. Record this as a "Manual Transaction" in DynamoDB
-    const repoBranchId = `${OWNER}/${REPO}#${BRANCH}`;
-    const { Item: parentItem } = await docClient.send(new GetCommand({ TableName: DYNAMO_TABLE, Key: { RepoBranch: repoBranchId, SK: 'HEAD' } }));
-    const parentTxnSK = parentItem ? parentItem.latestTxnSK : 'ROOT';
-    const newTxnSK = `TXN#${new Date().toISOString()}#MANUAL`;
+    // 2) Record in DynamoDB as DOC_ONLY (one hash)
+    if (!DYNAMO_TABLE) {
+      console.warn('⚠️ DYNAMODB_TABLE_NAME not set; skipping tx record.');
+      return;
+    }
 
-    await docClient.send(new TransactWriteCommand({ TransactItems: [
-      { Put: { TableName: DYNAMO_TABLE, Item: {
-          RepoBranch: repoBranchId, SK: newTxnSK, parentTxnSK,
-          type: 'MANUAL', manualCommitSha, author: AUTHOR, message: MESSAGE,
-      }}},
-      { Update: { TableName: DYNAMO_TABLE, Key: { RepoBranch: repoBranchId, SK: 'HEAD' },
-          UpdateExpression: 'SET latestTxnSK = :sk', ExpressionAttributeValues: { ':sk': newTxnSK },
-      }},
-    ]}));
+    const repoBranchId = `${OWNER}/${REPO}#${BRANCH}`;
+    const { Item: parentItem } = await docClient.send(new GetCommand({
+      TableName: DYNAMO_TABLE, Key: { RepoBranch: repoBranchId, SK: 'HEAD' }
+    }));
+    const parentTxnSK = parentItem ? parentItem.latestTxnSK : 'ROOT';
+    const newTxnSK = `TXN#${new Date().toISOString()}#DASHBOARD`;
+
+    const docChangeHash = sha256(NEW_CONTENT);
+    const conceptKey = extractConceptKeyFromMessage(MESSAGE) || null;
+
+    await docClient.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: DYNAMO_TABLE, Item: {
+            RepoBranch: repoBranchId, SK: newTxnSK, parentTxnSK,
+            type: 'MANUAL_DASHBOARD_EDIT',
+            txnKind: 'DOC_ONLY',                 // one hash, no parent change
+            createdAt: new Date().toISOString(),
+            manualCommitSha, author: AUTHOR, message: MESSAGE,
+            filePath: FILE_PATH, blobSha: blob.sha,
+            docChangeHash, docChangeType: 'UTF8_CONTENT_SHA256',
+            parentChangeHash: null, parentChangeType: null,
+            conceptKey,
+            relatedConceptKeys: conceptKey ? [conceptKey] : []
+        }}},
+        { Put: { TableName: DYNAMO_TABLE, Item: { RepoBranch: repoBranchId, SK: 'HEAD', latestTxnSK: newTxnSK, updatedAt: new Date().toISOString() } } }
+      ]
+    }));
+
     console.log('✅ Recorded manual transaction in DocFlow.');
   } catch (error) {
     console.error(`\n❌ An error occurred during the manual edit: ${error.message}`);

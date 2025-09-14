@@ -1,10 +1,13 @@
-// index.js (ESM) — FULL FILE with Gemini SDK + model fallback + robust GitHub/JIRA helpers
+// index.js (ESM) — PR merge → READLOG update + DynamoDB PAIR transaction (two hashes)
 import dotenv from 'dotenv';
 dotenv.config();
 
 import { Buffer } from 'node:buffer';
+import crypto from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import fetchImport from 'node-fetch';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 
 // Ensure fetch exists in Node environments < 18
 const fetchFn = (typeof fetch !== 'undefined') ? fetch : fetchImport;
@@ -17,6 +20,9 @@ const JIRA_BASE_URL  = (process.env.JIRA_BASE_URL || '').replace(/\/+$/, '');
 const JIRA_EMAIL     = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN || process.env.JIRA_API_KEY;
 
+const AWS_REGION     = process.env.AWS_REGION || 'us-east-1';
+const DYNAMO_TABLE   = process.env.DYNAMODB_TABLE_NAME;
+
 // -------------------- ARGS --------------------
 const [,, owner, repo, prNumberArg, jiraKeyArg] = process.argv;
 if (!owner || !repo || !prNumberArg) {
@@ -26,6 +32,8 @@ if (!owner || !repo || !prNumberArg) {
 const prNumber = Number(prNumberArg);
 
 // -------------------- UTILS --------------------
+const sha256 = (s) => crypto.createHash('sha256').update(s || '', 'utf8').digest('hex');
+
 function firstNonEmpty(...arr) {
   return arr.find(v => typeof v === 'string' && v.trim().length > 0) || null;
 }
@@ -45,44 +53,57 @@ function isoDateOnly(s) {
   try { return (new Date(s)).toISOString().slice(0,10); } catch { return 'unknown'; }
 }
 
+// -------------------- CLIENTS --------------------
+const dbClient = new DynamoDBClient({ region: AWS_REGION });
+const docClient = DynamoDBDocumentClient.from(dbClient);
+
 // -------------------- GITHUB HELPERS --------------------
-const ghHeaders = () => {
+const ghHeaders = (extra = {}) => {
   if (!GITHUB_TOKEN) {
     console.error('❌ Missing GITHUB_TOKEN env var');
     process.exit(1);
   }
   return {
     'Authorization': `Bearer ${GITHUB_TOKEN}`,
-    'Accept': 'application/vnd.github+json',
-    'User-Agent': 'DocFlow'
+    'User-Agent': 'DocFlow',
+    ...extra
   };
 };
 
 async function getPR(owner, repo, prNumber) {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
-  const r = await fetchFn(url, { headers: ghHeaders() });
+  const r = await fetchFn(url, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
   if (!r.ok) throw new Error(`GitHub getPR failed: ${r.status} ${r.statusText}`);
   return r.json();
 }
 
 async function getPRCommits(owner, repo, prNumber) {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits`;
-  const r = await fetchFn(url, { headers: ghHeaders() });
+  const r = await fetchFn(url, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
   if (!r.ok) throw new Error(`GitHub getPRCommits failed: ${r.status} ${r.statusText}`);
   return r.json();
 }
 
-async function upsertFile({ owner, repo, path, content, message, branch }) {
-  const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}${branch ? `?ref=${encodeURIComponent(branch)}` : ''}`;
-  let sha = null;
+async function getPRDiff(owner, repo, prNumber) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
+  const r = await fetchFn(url, { headers: ghHeaders({ 'Accept': 'application/vnd.github.v3.diff' }) });
+  if (!r.ok) throw new Error(`GitHub getPRDiff failed: ${r.status} ${r.statusText}`);
+  return r.text();
+}
 
-  const getRes = await fetchFn(getUrl, { headers: ghHeaders() });
+async function upsertFile({ owner, repo, path, content, message, branch }) {
+  const baseUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+  const getUrl = branch ? `${baseUrl}?ref=${encodeURIComponent(branch)}` : baseUrl;
+
+  // GET existing sha (if any)
+  let sha = null;
+  const getRes = await fetchFn(getUrl, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
   if (getRes.ok) {
     const existing = await getRes.json();
-    // If repo is empty or file is binary, guard content access
     if (existing && existing.sha) sha = existing.sha;
   }
 
+  // PUT new content
   const body = {
     message,
     content: Buffer.from(content, 'utf8').toString('base64'),
@@ -90,9 +111,9 @@ async function upsertFile({ owner, repo, path, content, message, branch }) {
     ...(branch ? { branch } : {})
   };
 
-  const putRes = await fetchFn(getUrl.replace(/\?ref=.*$/, ''), {
+  const putRes = await fetchFn(baseUrl, {
     method: 'PUT',
-    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    headers: ghHeaders({ 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' }),
     body: JSON.stringify(body)
   });
 
@@ -183,7 +204,6 @@ Return sections:
 4. **Docs/Follow-ups**
 `.trim();
 
-  // Try modern models in order; fall back if one isn't available in your project/region.
   const MODEL_CANDIDATES = [
     'gemini-1.5-flash',
     'gemini-1.5-flash-latest',
@@ -274,10 +294,10 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
   try {
     console.log(`🔧 Processing ${owner}/${repo} PR #${prNumber}${jiraKeyArg ? ` with JIRA ${jiraKeyArg}` : ''} ...`);
 
-    const pr = await getPR(owner, repo, prNumber);
+    const pr      = await getPR(owner, repo, prNumber);
     const commits = await getPRCommits(owner, repo, prNumber);
-
-    const jira = jiraKeyArg ? await getJiraIssue(jiraKeyArg) : null;
+    const prDiff  = await getPRDiff(owner, repo, prNumber); // raw unified diff text
+    const jira    = jiraKeyArg ? await getJiraIssue(jiraKeyArg) : null;
 
     const llm = await summarizeWithGemini({
       title: pr.title,
@@ -288,10 +308,12 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
 
     const section = renderChangelogEntry({ pr, commits, jira, llm });
 
+    // === Upsert READLOG.md (prepend) ===
     const PATH = 'READLOG.md';
+    const branch = pr.base?.ref || 'main';
     let existing = '';
-    const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(PATH)}`;
-    const getRes = await fetchFn(getUrl, { headers: ghHeaders() });
+    const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(PATH)}?ref=${encodeURIComponent(branch)}`;
+    const getRes = await fetchFn(getUrl, { headers: ghHeaders({ 'Accept': 'application/vnd.github+json' }) });
     if (getRes.ok) {
       const blob = await getRes.json();
       if (blob?.content) {
@@ -304,15 +326,80 @@ function renderChangelogEntry({ pr, commits, jira, llm }) {
     }
 
     const newContent = [section, existing].join('\n');
-    const result = await upsertFile({
+    const writeResult = await upsertFile({
       owner, repo,
       path: PATH,
       content: newContent,
       message: `docs(readlog): add PR #${prNumber}${jira ? ` + ${jira.key}` : ''}`,
-      branch: pr.base?.ref || 'main'
+      branch
     });
 
-    console.log(`✅ Updated ${PATH} at ${result?.content?.html_url || '(unknown URL)'}`);
+    console.log(`✅ Updated ${PATH} at ${writeResult?.content?.html_url || '(unknown URL)'} (sha ${writeResult?.content?.sha || 'n/a'})`);
+
+    // === Record DynamoDB Transaction as PAIR ===
+    if (!DYNAMO_TABLE) {
+      console.warn('⚠️ DYNAMODB_TABLE_NAME not set; skipping tx record.');
+      return;
+    }
+
+    const repoBranchId = `${owner}/${repo}#${branch}`;
+    const { Item: parentHead } = await docClient.send(new GetCommand({
+      TableName: DYNAMO_TABLE,
+      Key: { RepoBranch: repoBranchId, SK: 'HEAD' }
+    }));
+
+    const parentTxnSK = parentHead ? parentHead.latestTxnSK : 'ROOT';
+    const newTxnSK = `TXN#${new Date().toISOString()}#PR#${prNumber}`;
+
+    const parentChangeHash = sha256(prDiff || '');
+    const docChangeHash = sha256(section || '');
+    const conceptKey = jira?.key ? `JIRA:${jira.key}` : `PR#${prNumber}`;
+
+    const txnItem = {
+      RepoBranch: repoBranchId,
+      SK: newTxnSK,
+      parentTxnSK,
+      type: 'PR_MERGE',
+      txnKind: 'PAIR',                       // has both hashes
+      createdAt: new Date().toISOString(),
+
+      // PR metadata
+      prNumber,
+      prTitle: pr.title,
+      prAuthor: pr.user?.login || null,
+      prMergedAt: pr.merged_at || null,
+      mergeCommitSha: pr.merge_commit_sha || null,
+
+      // JIRA (optional)
+      jiraKey: jira?.key || null,
+
+      // Hashes for reversibility
+      parentChangeHash,              // sha256 of PR diff text
+      parentChangeType: 'GITHUB_PR_DIFF_SHA256',
+      docChangeHash,                 // sha256 of the READLOG section we prepended
+      docChangeType: 'READLOG_SECTION_SHA256',
+
+      // Concept linking
+      conceptKey,
+      relatedConceptKeys: [conceptKey],
+
+      // Pointers to artifacts
+      docFilePath: PATH,
+      docFileSha: writeResult?.content?.sha || null,
+
+      // For convenience
+      summaryPreview: truncate(section, 400)
+    };
+
+    await docClient.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: DYNAMO_TABLE, Item: txnItem } },
+        { Put: { TableName: DYNAMO_TABLE, Item: { RepoBranch: repoBranchId, SK: 'HEAD', latestTxnSK: newTxnSK, updatedAt: new Date().toISOString() } } }
+      ]
+    }));
+
+    console.log(`🧾 Recorded PR transaction ${newTxnSK} (parent=${parentTxnSK})`);
+
   } catch (err) {
     console.error('❌ Failed:', err);
     process.exit(1);
