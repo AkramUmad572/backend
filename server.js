@@ -78,30 +78,44 @@ app.post('/api/ingest', (req, res) => {
     return res.status(202).json({ message: 'Accepted: docs-only push processed.', commit: commitSha });
   }
 
-  // Existing pull_request flow (generate READLOG on merge)
+  // Enhanced pull_request flow (generate READLOG and README on merge)
   if (event === 'pull_request') {
-    const { action, pull_request, repository } = req.body;
+    // Handle both JSON and form-encoded payloads
+    let payload = req.body;
+    if (req.body.payload) {
+      // GitHub sends form-encoded data with JSON in 'payload' field
+      payload = JSON.parse(req.body.payload);
+    }
+    
+    const { action, pull_request, repository } = payload;
     if (!pull_request || !repository) {
       console.warn('⚠️ Malformed pull_request payload.');
       return res.status(400).json({ error: 'Malformed payload' });
     }
 
     console.log(`PR Event: ${action} - PR #${pull_request.number}`);
+    console.log(`PR Details: closed=${pull_request.closed}, closed_at=${pull_request.closed_at}, state=${pull_request.state}`);
 
-    if (action === 'closed' && pull_request.merged) {
-      console.log(`🎉 PR #${pull_request.number} was merged! Triggering changelog update...`);
+    // Trigger when PR is closed (assuming it was merged since we can't distinguish)
+    if (action === 'closed' && pull_request.state === 'closed') {
+      console.log(`🎉 PR #${pull_request.number} was closed! Triggering changelog update...`);
+
       const owner = repository.owner.login;
       const repo = repository.name;
       const prNumber = pull_request.number;
-      run(`node index.js ${owner} ${repo} ${prNumber}`, `index.js PR#${prNumber}`);
-      return res.status(202).json({
-        message: 'Accepted: PR merge event received and changelog generation process started.',
-        prNumber
-      });
-    }
 
-    console.log(`ℹ️  PR #${pull_request.number} was ${action} but not a merge. No action taken.`);
-    return res.status(200).json({ message: 'Event received but not a merge.' });
+      // Execute both changelog and README processing
+      run(`node index.js ${owner} ${repo} ${prNumber}`, `READLOG-${prNumber}`);
+      run(`node readme-processor.js ${owner} ${repo} ${prNumber}`, `README-${prNumber}`);
+
+      return res.status(202).json({
+        message: 'Accepted: PR close event received and changelog generation process started.',
+        prNumber: prNumber,
+      });
+    } else {
+      console.log(`ℹ️  PR #${pull_request.number} was ${action} but not closed. No action taken.`);
+      return res.status(200).json({ message: 'Event received but not a close action.' });
+    }
   }
 
   console.log(`ℹ️  Received unhandled event: ${event}`);
